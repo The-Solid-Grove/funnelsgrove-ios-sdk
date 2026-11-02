@@ -79,7 +79,7 @@ Swift Package в репо `funnelsgrove-ios-sdk`: `swift-tools-version: 6.0`, iO
     acceptTestSubscriptions: Bool = false,
     apiBaseURL: URL = URL(string: "https://sdk-api.funnelsgrove.com")!
   )
-  public static var shared: FunnelsGrove { get }   // до configure — precondition failure
+  public static var shared: FunnelsGrove { get }   // до configure — fatalError
 
   @discardableResult public func handle(_ url: URL) -> Bool
   @discardableResult public func handle(_ userActivity: NSUserActivity) -> Bool
@@ -105,7 +105,7 @@ public enum FunnelsGroveError: Error, Equatable, Sendable {
 }
 ```
 
-`configure` останавливает приложение (`precondition`), если ключ пустой, содержит пробельные символы или похож на секретный: начинается с `sdk_sec_` или `fg_key_`. Секретный ключ в сборке приложения достаётся любому, кто её скачал. Формат publishable key (`sdk_pub_…`) не проверяется, чтобы новый формат ключей FG не ронял приложения.
+`configure` останавливает приложение (`fatalError`: в отличие от `precondition`, он печатает причину и в Release-сборке), если ключ пустой, содержит пробельные символы или похож на секретный: начинается с `sdk_sec_` или `fg_key_`. Секретный ключ в сборке приложения достаётся любому, кто её скачал. Формат publishable key (`sdk_pub_…`) не проверяется, чтобы новый формат ключей FG не ронял приложения.
 
 Подключение в приложении:
 

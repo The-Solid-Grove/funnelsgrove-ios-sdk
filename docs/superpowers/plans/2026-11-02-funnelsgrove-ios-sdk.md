@@ -2730,7 +2730,7 @@ curl -sS -X POST https://sdk-api.funnelsgrove.com/sdk/public/users/track_login \
 - [ ] **Step 6 (по желанию): Universal Link с чужого для SDK домена**
 
 1. В дашборде appsilove (`https://dashboard.appsilove.co`) или по SQL из `appsilove/links/README.md` завести строку `fgdemo` в `link_apps`: Team ID владельца, bundle ID `com.funnelsgrove.demo`, любой существующий `app_store_id`. Если в `Local.xcconfig` задан свой `PRODUCT_BUNDLE_IDENTIFIER`, в строке нужен он. Associated Domains подписывает только платная команда разработчика, не personal team.
-2. Проверить, что `https://fgdemo.links.appsilove.co/.well-known/apple-app-site-association` отдаёт `<Team ID>.com.funnelsgrove.demo`.
+2. Проверить, что `https://fgdemo.links.appsilove.co/.well-known/apple-app-site-association` отдаёт `<Team ID>.<bundle ID>`: `com.funnelsgrove.demo` или свой bundle ID из `Local.xcconfig`.
 3. В `Config/Local.xcconfig` раскомментировать обе строки Universal Links, задать `FG_DEMO_LINK_HOST = fgdemo.links.appsilove.co` (оставить `CODE_SIGN_ENTITLEMENTS = Config/UniversalLinks.entitlements`), выполнить `xcodegen generate` и снова поставить Debug-сборку. Пример в `Local.xcconfig.example` нарочно нейтральный (`go.example.com`): файл видят клиенты FG.
 4. На iPhone включить Settings → Developer → Associated Domains Development. В Settings → Developer → Universal Links → Diagnostics ввести `https://fgdemo.links.appsilove.co/open?user_id=u_ul` и убедиться, что ссылка сопоставлена с FunnelsGrove Demo.
 5. Открыть эту ссылку тапом из Notes: демо показывает `u_ul`. В «Last links received» записать, какой обработчик её получил (`onContinueUserActivity` или `onOpenURL`), при холодном и тёплом старте.
