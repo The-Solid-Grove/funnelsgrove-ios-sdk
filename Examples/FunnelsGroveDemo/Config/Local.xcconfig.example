@@ -5,6 +5,7 @@ FG_PUBLISHABLE_KEY = your-funnelsgrove-project-sdk-publishable-key
 // PRODUCT_BUNDLE_IDENTIFIER = com.example.funnelsgrove-demo
 
 // Optional Universal Links: a domain you control whose apple-app-site-association file lists
-// <Team ID>.<bundle ID> for the path /open. Uncomment both lines.
+// <Team ID>.<bundle ID> for the path /open. Needs a paid developer team: personal teams cannot sign
+// Associated Domains. Uncomment both lines.
 // FG_DEMO_LINK_HOST = go.example.com
 // CODE_SIGN_ENTITLEMENTS = Config/UniversalLinks.entitlements

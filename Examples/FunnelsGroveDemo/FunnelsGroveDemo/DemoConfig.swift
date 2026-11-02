@@ -6,7 +6,8 @@ enum DemoConfig {
 
     private static func value(for key: String) -> String {
         guard let value = Bundle.main.object(forInfoDictionaryKey: key) as? String, !value.isEmpty else {
-            preconditionFailure("\(key) is empty: fill in Config/Local.xcconfig")
+            // fatalError, not preconditionFailure: a Release build drops a precondition's message.
+            fatalError("\(key) is empty: fill in Config/Local.xcconfig")
         }
         return value
     }

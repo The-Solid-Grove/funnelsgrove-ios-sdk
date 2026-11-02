@@ -4,7 +4,9 @@ import SwiftUI
 @main
 struct FunnelsGroveDemoApp: App {
     init() {
-        // A QA app: it must show Stripe test-mode purchases as active. Real apps never pass true in release builds.
+        // QA only: Stripe test-mode purchases show as active, and anyone can make one with a test card. A real app
+        // passes a flag that only Debug or a QA configuration sets, never the one it archives (README, "Test
+        // subscriptions").
         FunnelsGrove.configure(publishableKey: DemoConfig.publishableKey, acceptTestSubscriptions: true)
     }
 

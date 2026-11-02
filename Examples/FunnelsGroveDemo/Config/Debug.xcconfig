@@ -1,4 +1,5 @@
 #include "Shared.xcconfig"
 
-// With Universal Links on: read the AASA file from the server, bypassing Apple's CDN. Needs Developer Mode on the device.
+// With Universal Links on: read the AASA file from the server, bypassing Apple's CDN. Needs Developer Mode and
+// Settings > Developer > Associated Domains Development on the device.
 FG_DEMO_LINK_MODE = ?mode=developer

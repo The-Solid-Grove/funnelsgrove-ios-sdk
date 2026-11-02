@@ -3,14 +3,18 @@ import SwiftUI
 
 struct ContentView: View {
     private static let loginHint = "Records Logged into app in FunnelsGrove for the stored user"
+    private static let maxLoggedLinks = 10
 
     @State private var userId = FunnelsGrove.shared.userId
     @State private var email = FunnelsGrove.shared.email
     @State private var status = "Not checked"
     @State private var isChecking = false
+    /// Counts checks, so that only the latest one shows its answer.
+    @State private var checkGeneration = 0
     @State private var loginStatus = Self.loginHint
     @State private var isTracking = false
     @State private var pastedLink = ""
+    // QA only: the links carry the user ID and email. A real app never shows, logs or stores them.
     @State private var linkLog: [String] = []
     @Environment(\.scenePhase) private var scenePhase
 
@@ -46,18 +50,19 @@ struct ContentView: View {
                 }
                 Section("Paste a link") {
                     TextField("Link", text: $pastedLink, prompt: Text(verbatim: "fgdemo://open?user_id=…&email=…"))
+                        .keyboardType(.URL)
                         .textInputAutocapitalization(.never)
                         .autocorrectionDisabled()
-                    Button("Handle link") {
-                        if let url = URL(string: pastedLink.trimmingCharacters(in: .whitespacesAndNewlines)) {
-                            linked(FunnelsGrove.shared.handle(url))
-                        }
-                    }
+                        .onSubmit(handlePastedLink)
+                    Button("Handle link", action: handlePastedLink)
                 }
                 Section {
                     Button("Reset", role: .destructive) {
                         FunnelsGrove.shared.reset()
                         refreshUser()
+                        // Drop the answer of a check still running.
+                        checkGeneration += 1
+                        isChecking = false
                         status = "Not checked"
                         loginStatus = Self.loginHint
                     }
@@ -68,16 +73,41 @@ struct ContentView: View {
         // A custom scheme arrives in onOpenURL; SwiftUI routes a Universal Link to one of these two handlers.
         // "Last links received" shows which.
         .onContinueUserActivity(NSUserActivityTypeBrowsingWeb) { activity in
-            linkLog.append("onContinueUserActivity: \(activity.webpageURL?.absoluteString ?? "no URL")")
+            log("onContinueUserActivity: \(activity.webpageURL?.absoluteString ?? "no URL")")
+            // A real app routes its own links before handing the rest to the SDK.
             linked(FunnelsGrove.shared.handle(activity))
         }
         .onOpenURL { url in
-            linkLog.append("onOpenURL: \(url.absoluteString)")
+            log("onOpenURL: \(url.absoluteString)")
             linked(FunnelsGrove.shared.handle(url))
         }
         .onChange(of: scenePhase) { _, phase in
             // iCloud Keychain may deliver a user in the background; the SDK reads it while it has none.
-            if phase == .active { refreshUser() }
+            guard phase == .active else { return }
+            let isAnotherUser = FunnelsGrove.shared.userId != userId
+            refreshUser()
+            // The status on screen was checked for no user or for another one.
+            if isAnotherUser {
+                status = "Not checked"
+                loginStatus = Self.loginHint
+            }
+        }
+    }
+
+    private func handlePastedLink() {
+        let text = pastedLink.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let url = URL(string: text) else {
+            status = "Ignored: the pasted text is not a URL"
+            return
+        }
+        log("Pasted: \(url.absoluteString)")
+        linked(FunnelsGrove.shared.handle(url))
+    }
+
+    private func log(_ entry: String) {
+        linkLog.append(entry)
+        if linkLog.count > Self.maxLoggedLinks {
+            linkLog.removeFirst(linkLog.count - Self.maxLoggedLinks)
         }
     }
 
@@ -92,21 +122,30 @@ struct ContentView: View {
             return
         }
         refreshUser()
-        // The demo records the login with its own button, so that a test can see it apart from the link.
+        // A check that already finished saw the previous user: check again.
         Task { await check() }
+        // A real app calls trackLogin() here when it has no sign-in of its own, or while the user is signed in
+        // (README, "App login"). The demo records the login with its own button, so that a test sees it apart
+        // from the link.
     }
 
+    /// Shows the answer of the latest check only: a link can start one while another runs.
     private func check() async {
+        checkGeneration += 1
+        let generation = checkGeneration
         isChecking = true
         status = "Checking…"
-        defer { isChecking = false }
+        let answer: String
         do {
-            status = describe(try await FunnelsGrove.shared.checkSubscription())
+            answer = describe(try await FunnelsGrove.shared.checkSubscription())
         } catch is CancellationError {
-            status = "Not checked"
+            answer = "Not checked"
         } catch {
-            status = "Error: \(error)"
+            answer = "Error: \(error)"
         }
+        guard generation == checkGeneration else { return }
+        status = answer
+        isChecking = false
     }
 
     private func describe(_ result: SubscriptionStatus) -> String {

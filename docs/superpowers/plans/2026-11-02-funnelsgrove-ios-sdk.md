@@ -1682,7 +1682,8 @@ public final class FunnelsGrove {
     /// The instance created by `configure`. Using it before `configure` stops the app.
     public static var shared: FunnelsGrove {
         guard let instance else {
-            preconditionFailure("Call FunnelsGrove.configure(publishableKey:) before FunnelsGrove.shared")
+            // fatalError, not preconditionFailure: a Release build drops a precondition's message.
+            fatalError("Call FunnelsGrove.configure(publishableKey:) before FunnelsGrove.shared")
         }
         return instance
     }
@@ -1699,7 +1700,7 @@ public final class FunnelsGrove {
         apiBaseURL: URL = URL(string: "https://sdk-api.funnelsgrove.com")!
     ) {
         if let problem = publishableKeyProblem(publishableKey) {
-            preconditionFailure(problem)
+            fatalError(problem)
         }
         instance = FunnelsGrove(
             configuration: Configuration(acceptTestSubscriptions: acceptTestSubscriptions),
@@ -2303,6 +2304,7 @@ targets:
     settings:
       base:
         CODE_SIGN_STYLE: Automatic
+        SWIFT_VERSION: "6.0"
     scheme: {}
 ```
 
@@ -2327,7 +2329,8 @@ CODE_SIGN_ENTITLEMENTS =
 ```
 #include "Shared.xcconfig"
 
-// With Universal Links on: read the AASA file from the server, bypassing Apple's CDN. Needs Developer Mode on the device.
+// With Universal Links on: read the AASA file from the server, bypassing Apple's CDN. Needs Developer Mode and
+// Settings > Developer > Associated Domains Development on the device.
 FG_DEMO_LINK_MODE = ?mode=developer
 ```
 
@@ -2349,7 +2352,8 @@ FG_PUBLISHABLE_KEY = your-funnelsgrove-project-sdk-publishable-key
 // PRODUCT_BUNDLE_IDENTIFIER = com.example.funnelsgrove-demo
 
 // Optional Universal Links: a domain you control whose apple-app-site-association file lists
-// <Team ID>.<bundle ID> for the path /open. Uncomment both lines.
+// <Team ID>.<bundle ID> for the path /open. Needs a paid developer team: personal teams cannot sign
+// Associated Domains. Uncomment both lines.
 // FG_DEMO_LINK_HOST = go.example.com
 // CODE_SIGN_ENTITLEMENTS = Config/UniversalLinks.entitlements
 ```
@@ -2378,7 +2382,9 @@ import SwiftUI
 @main
 struct FunnelsGroveDemoApp: App {
     init() {
-        // A QA app: it must show Stripe test-mode purchases as active. Real apps never pass true in release builds.
+        // QA only: Stripe test-mode purchases show as active, and anyone can make one with a test card. A real app
+        // passes a flag that only Debug or a QA configuration sets, never the one it archives (README, "Test
+        // subscriptions").
         FunnelsGrove.configure(publishableKey: DemoConfig.publishableKey, acceptTestSubscriptions: true)
     }
 
@@ -2401,7 +2407,8 @@ enum DemoConfig {
 
     private static func value(for key: String) -> String {
         guard let value = Bundle.main.object(forInfoDictionaryKey: key) as? String, !value.isEmpty else {
-            preconditionFailure("\(key) is empty: fill in Config/Local.xcconfig")
+            // fatalError, not preconditionFailure: a Release build drops a precondition's message.
+            fatalError("\(key) is empty: fill in Config/Local.xcconfig")
         }
         return value
     }
@@ -2418,14 +2425,18 @@ import SwiftUI
 
 struct ContentView: View {
     private static let loginHint = "Records Logged into app in FunnelsGrove for the stored user"
+    private static let maxLoggedLinks = 10
 
     @State private var userId = FunnelsGrove.shared.userId
     @State private var email = FunnelsGrove.shared.email
     @State private var status = "Not checked"
     @State private var isChecking = false
+    /// Counts checks, so that only the latest one shows its answer.
+    @State private var checkGeneration = 0
     @State private var loginStatus = Self.loginHint
     @State private var isTracking = false
     @State private var pastedLink = ""
+    // QA only: the links carry the user ID and email. A real app never shows, logs or stores them.
     @State private var linkLog: [String] = []
     @Environment(\.scenePhase) private var scenePhase
 
@@ -2461,18 +2472,19 @@ struct ContentView: View {
                 }
                 Section("Paste a link") {
                     TextField("Link", text: $pastedLink, prompt: Text(verbatim: "fgdemo://open?user_id=…&email=…"))
+                        .keyboardType(.URL)
                         .textInputAutocapitalization(.never)
                         .autocorrectionDisabled()
-                    Button("Handle link") {
-                        if let url = URL(string: pastedLink.trimmingCharacters(in: .whitespacesAndNewlines)) {
-                            linked(FunnelsGrove.shared.handle(url))
-                        }
-                    }
+                        .onSubmit(handlePastedLink)
+                    Button("Handle link", action: handlePastedLink)
                 }
                 Section {
                     Button("Reset", role: .destructive) {
                         FunnelsGrove.shared.reset()
                         refreshUser()
+                        // Drop the answer of a check still running.
+                        checkGeneration += 1
+                        isChecking = false
                         status = "Not checked"
                         loginStatus = Self.loginHint
                     }
@@ -2483,16 +2495,41 @@ struct ContentView: View {
         // A custom scheme arrives in onOpenURL; SwiftUI routes a Universal Link to one of these two handlers.
         // "Last links received" shows which.
         .onContinueUserActivity(NSUserActivityTypeBrowsingWeb) { activity in
-            linkLog.append("onContinueUserActivity: \(activity.webpageURL?.absoluteString ?? "no URL")")
+            log("onContinueUserActivity: \(activity.webpageURL?.absoluteString ?? "no URL")")
+            // A real app routes its own links before handing the rest to the SDK.
             linked(FunnelsGrove.shared.handle(activity))
         }
         .onOpenURL { url in
-            linkLog.append("onOpenURL: \(url.absoluteString)")
+            log("onOpenURL: \(url.absoluteString)")
             linked(FunnelsGrove.shared.handle(url))
         }
         .onChange(of: scenePhase) { _, phase in
             // iCloud Keychain may deliver a user in the background; the SDK reads it while it has none.
-            if phase == .active { refreshUser() }
+            guard phase == .active else { return }
+            let isAnotherUser = FunnelsGrove.shared.userId != userId
+            refreshUser()
+            // The status on screen was checked for no user or for another one.
+            if isAnotherUser {
+                status = "Not checked"
+                loginStatus = Self.loginHint
+            }
+        }
+    }
+
+    private func handlePastedLink() {
+        let text = pastedLink.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let url = URL(string: text) else {
+            status = "Ignored: the pasted text is not a URL"
+            return
+        }
+        log("Pasted: \(url.absoluteString)")
+        linked(FunnelsGrove.shared.handle(url))
+    }
+
+    private func log(_ entry: String) {
+        linkLog.append(entry)
+        if linkLog.count > Self.maxLoggedLinks {
+            linkLog.removeFirst(linkLog.count - Self.maxLoggedLinks)
         }
     }
 
@@ -2507,21 +2544,30 @@ struct ContentView: View {
             return
         }
         refreshUser()
-        // The demo records the login with its own button, so that a test can see it apart from the link.
+        // A check that already finished saw the previous user: check again.
         Task { await check() }
+        // A real app calls trackLogin() here when it has no sign-in of its own, or while the user is signed in
+        // (README, "App login"). The demo records the login with its own button, so that a test sees it apart
+        // from the link.
     }
 
+    /// Shows the answer of the latest check only: a link can start one while another runs.
     private func check() async {
+        checkGeneration += 1
+        let generation = checkGeneration
         isChecking = true
         status = "Checking…"
-        defer { isChecking = false }
+        let answer: String
         do {
-            status = describe(try await FunnelsGrove.shared.checkSubscription())
+            answer = describe(try await FunnelsGrove.shared.checkSubscription())
         } catch is CancellationError {
-            status = "Not checked"
+            answer = "Not checked"
         } catch {
-            status = "Error: \(error)"
+            answer = "Error: \(error)"
         }
+        guard generation == checkGeneration else { return }
+        status = answer
+        isChecking = false
     }
 
     private func describe(_ result: SubscriptionStatus) -> String {
@@ -2683,16 +2729,18 @@ curl -sS -X POST https://sdk-api.funnelsgrove.com/sdk/public/users/track_login \
 
 - [ ] **Step 6 (по желанию): Universal Link с чужого для SDK домена**
 
-1. В дашборде appsilove (`https://dashboard.appsilove.co`) или по SQL из `appsilove/links/README.md` завести строку `fgdemo` в `link_apps`: Team ID владельца, bundle ID `com.funnelsgrove.demo`, любой существующий `app_store_id`.
+1. В дашборде appsilove (`https://dashboard.appsilove.co`) или по SQL из `appsilove/links/README.md` завести строку `fgdemo` в `link_apps`: Team ID владельца, bundle ID `com.funnelsgrove.demo`, любой существующий `app_store_id`. Если в `Local.xcconfig` задан свой `PRODUCT_BUNDLE_IDENTIFIER`, в строке нужен он. Associated Domains подписывает только платная команда разработчика, не personal team.
 2. Проверить, что `https://fgdemo.links.appsilove.co/.well-known/apple-app-site-association` отдаёт `<Team ID>.com.funnelsgrove.demo`.
 3. В `Config/Local.xcconfig` раскомментировать обе строки Universal Links, задать `FG_DEMO_LINK_HOST = fgdemo.links.appsilove.co` (оставить `CODE_SIGN_ENTITLEMENTS = Config/UniversalLinks.entitlements`), выполнить `xcodegen generate` и снова поставить Debug-сборку. Пример в `Local.xcconfig.example` нарочно нейтральный (`go.example.com`): файл видят клиенты FG.
 4. На iPhone включить Settings → Developer → Associated Domains Development. В Settings → Developer → Universal Links → Diagnostics ввести `https://fgdemo.links.appsilove.co/open?user_id=u_ul` и убедиться, что ссылка сопоставлена с FunnelsGrove Demo.
 5. Открыть эту ссылку тапом из Notes: демо показывает `u_ul`. В «Last links received» записать, какой обработчик её получил (`onContinueUserActivity` или `onOpenURL`), при холодном и тёплом старте.
 
-Подпись проверяется так: entitlements сборки должны содержать `applinks:fgdemo.links.appsilove.co?mode=developer`.
+Подпись проверяется так: entitlements сборки должны содержать `applinks:fgdemo.links.appsilove.co?mode=developer`. Ожидается строка `[String] applinks:fgdemo.links.appsilove.co?mode=developer`.
 
 ```bash
-codesign -d --entitlements - "$(find ~/Library/Developer/Xcode/DerivedData -maxdepth 6 -path '*Debug-iphoneos/FunnelsGroveDemo.app' | head -1)" 2>/dev/null | grep -A2 associated-domains
+APP=$(ls -td ~/Library/Developer/Xcode/DerivedData/FunnelsGroveDemo-*/Build/Products/Debug-iphoneos/FunnelsGroveDemo.app | head -1)
+echo "${APP:?no device build of FunnelsGroveDemo in DerivedData}"
+codesign -d --entitlements - "$APP" 2>/dev/null | grep applinks
 ```
 
 Если ссылка открылась в Safari, а не в приложении, проверить по порядку: AASA через `curl`, Team ID и bundle ID в строке `fgdemo`, entitlements сборки, включён ли Associated Domains Development.

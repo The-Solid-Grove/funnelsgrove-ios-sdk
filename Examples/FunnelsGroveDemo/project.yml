@@ -31,4 +31,5 @@ targets:
     settings:
       base:
         CODE_SIGN_STYLE: Automatic
+        SWIFT_VERSION: "6.0"
     scheme: {}
