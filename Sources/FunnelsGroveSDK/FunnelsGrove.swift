@@ -19,7 +19,8 @@ public final class FunnelsGrove {
     /// The instance created by `configure`. Using it before `configure` stops the app.
     public static var shared: FunnelsGrove {
         guard let instance else {
-            preconditionFailure("Call FunnelsGrove.configure(publishableKey:) before FunnelsGrove.shared")
+            // fatalError, not preconditionFailure: a Release build drops a precondition's message.
+            fatalError("Call FunnelsGrove.configure(publishableKey:) before FunnelsGrove.shared")
         }
         return instance
     }
@@ -36,7 +37,7 @@ public final class FunnelsGrove {
         apiBaseURL: URL = URL(string: "https://sdk-api.funnelsgrove.com")!
     ) {
         if let problem = publishableKeyProblem(publishableKey) {
-            preconditionFailure(problem)
+            fatalError(problem)
         }
         instance = FunnelsGrove(
             configuration: Configuration(acceptTestSubscriptions: acceptTestSubscriptions),
