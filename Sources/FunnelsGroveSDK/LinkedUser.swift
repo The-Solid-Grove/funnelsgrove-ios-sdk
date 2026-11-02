@@ -1,6 +1,7 @@
 import Foundation
 
-/// The buyer a FunnelsGrove link points at: the user ID and, when the link carries one, the email they bought with.
+/// A FunnelsGrove buyer: the user ID and, when a link carried one, the email they bought with. Also the keychain
+/// record: the coding keys are a stored format, and renaming one loses the user saved by an earlier version.
 struct LinkedUser: Codable, Equatable, Sendable {
     let userId: String
     /// Not verified: the address the buyer typed in the funnel, known to anyone who has the link.

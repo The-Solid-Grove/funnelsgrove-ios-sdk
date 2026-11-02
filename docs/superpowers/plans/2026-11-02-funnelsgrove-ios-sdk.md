@@ -194,8 +194,11 @@ final class LinkParserTests: XCTestCase {
         }
     }
 
-    func testTakesTheFirstUserId() {
+    func testTakesTheFirstUserIdAndEmail() {
         XCTAssertEqual(user("fgdemo://open?user_id=u_1&user_id=u_2")?.userId, "u_1")
+        XCTAssertEqual(user("fgdemo://open?user_id=u_1&email=a%40b.co&email=c%40d.co")?.email, "a@b.co")
+        // The first email counts even when it cannot be an address.
+        XCTAssertEqual(user("fgdemo://open?user_id=u_1&email=nonsense&email=c%40d.co"), LinkedUser(userId: "u_1"))
     }
 
     func testRejectsMissingOrMalformedUserIds() {
@@ -205,6 +208,8 @@ final class LinkParserTests: XCTestCase {
         XCTAssertNil(user("https://go.example.com/open?User_Id=u_1"))
         XCTAssertNil(user("https://go.example.com/open?user_id=u%201"))
         XCTAssertNil(user("https://go.example.com/open?user_id=u_1%0A"))
+        // NUL is a control character but not whitespace.
+        XCTAssertNil(user("https://go.example.com/open?user_id=u_1%00"))
         XCTAssertNil(user("https://go.example.com/open?user_id=" + String(repeating: "a", count: 257)))
         // One grapheme, 601 UTF-8 bytes: "a" followed by 300 combining acute accents.
         XCTAssertNil(user("https://go.example.com/open?user_id=a" + String(repeating: "%CC%81", count: 300)))
@@ -233,7 +238,11 @@ final class LinkParserTests: XCTestCase {
             "buyer.example.com",
             "a%20b%40example.com",
             "a%0A%40example.com",
+            // A right-to-left override: a control character that is not whitespace.
+            "a%E2%80%AE%40example.com",
             String(repeating: "a", count: 250) + "%40b.co",
+            // 130 characters, 255 UTF-8 bytes.
+            String(repeating: "%C3%BC", count: 125) + "%40b.co",
         ] {
             XCTAssertEqual(user("fgdemo://open?user_id=u_1&email=" + email), LinkedUser(userId: "u_1"), email)
         }
@@ -262,7 +271,8 @@ cd /Users/e/work2/appsilove/funnelsgrove-ios-sdk && rm Tests/FunnelsGroveSDKTest
 ```swift
 import Foundation
 
-/// The buyer a FunnelsGrove link points at: the user ID and, when the link carries one, the email they bought with.
+/// A FunnelsGrove buyer: the user ID and, when a link carried one, the email they bought with. Also the keychain
+/// record: the coding keys are a stored format, and renaming one loses the user saved by an earlier version.
 struct LinkedUser: Codable, Equatable, Sendable {
     let userId: String
     /// Not verified: the address the buyer typed in the funnel, known to anyone who has the link.
@@ -296,7 +306,8 @@ enum LinkParser {
     static let maxUserIdLength = 256
     static let maxEmailLength = 254
 
-    /// Returns the buyer a FunnelsGrove link carries, or `nil` when the URL has no valid `user_id`.
+    /// Returns the buyer a FunnelsGrove link carries, or `nil` when the first `user_id` in its query is missing or
+    /// not valid.
     /// Any scheme and host pass: the app's entitlements, its AASA file and its URL types decide which links open it.
     static func user(from url: URL) -> LinkedUser? {
         guard
@@ -315,8 +326,9 @@ enum LinkParser {
         !value.isEmpty && value.utf8.count <= maxUserIdLength && !value.unicodeScalars.contains(where: isForbidden)
     }
 
-    /// The trimmed address if it can be one: at most 254 UTF-8 bytes, an `@`, no whitespace or control characters
-    /// inside. This keeps junk out of the app; it does not prove that the address works or belongs to the user.
+    /// The trimmed value if it passes a loose check: at most 254 UTF-8 bytes, an `@`, no whitespace or control
+    /// characters inside. It keeps blanks, line breaks and invisible characters out of the app, but `@` alone still
+    /// passes, and it does not prove that the address works or belongs to the user.
     static func validEmail(_ value: String?) -> String? {
         guard
             let email = value?.trimmingCharacters(in: .whitespacesAndNewlines),
@@ -856,7 +868,7 @@ git commit -m "feat: call FunnelsGrove verify_subscription and track_login" -m "
 - Create: `Sources/FunnelsGroveSDK/UserStore.swift`
 - Test: `Tests/FunnelsGroveSDKTests/UserStoreTests.swift`
 
-Одна запись generic password: `kSecAttrService = "com.funnelsgrove.sdk"`, `kSecAttrAccount = "user"`, значение — JSON `LinkedUser`. Доступность `AfterFirstUnlock`, синхронизация через iCloud Keychain, чтение и удаление с `kSecAttrSynchronizableAny`. Неизменённая запись не перезаписывается. Запись, которую не удалось разобрать, считается отсутствующей. Тесты проверяют формат записи; сами вызовы Keychain — в задаче 7.
+Одна запись generic password: `kSecAttrService = "com.funnelsgrove.sdk"`, `kSecAttrAccount = "user"`, значение — JSON `LinkedUser`. Доступность `AfterFirstUnlock`, синхронизация через iCloud Keychain, чтение и удаление с `kSecAttrSynchronizableAny`. Неизменённая запись не перезаписывается. Запись, которую не удалось разобрать или в которой негодный `user_id`, считается отсутствующей; негодный email в записи читается как `nil`, теми же правилами, что в ссылке. Тесты проверяют формат записи; сами вызовы Keychain — в задаче 7.
 
 - [ ] **Step 1: Написать падающий тест**
 
@@ -889,8 +901,10 @@ final class UserStoreTests: XCTestCase {
         }
     }
 
-    func testReadsAnItemWithoutTheEmailKey() {
-        XCTAssertEqual(KeychainUserStore.decode(Data(#"{"userId":"u_1"}"#.utf8)), LinkedUser(userId: "u_1"))
+    func testReadsAnItemWithoutAUsableEmail() {
+        for json in [#"{"userId":"u_1"}"#, #"{"userId":"u_1","email":""}"#, #"{"userId":"u_1","email":"a b"}"#] {
+            XCTAssertEqual(KeychainUserStore.decode(Data(json.utf8)), LinkedUser(userId: "u_1"), json)
+        }
     }
 
     func testTreatsDamagedDataAsNoUser() {
@@ -981,14 +995,15 @@ struct KeychainUserStore: UserStore {
         try JSONEncoder().encode(user)
     }
 
-    /// The stored user, or `nil` for data that is not one: a damaged item must not turn into a user ID.
+    /// The stored user, or `nil` for data that is not one: a damaged item must not turn into a user ID. The ID and
+    /// the email pass the same checks as in a link, so tightening the ID check drops users stored under the old one.
     static func decode(_ data: Data) -> LinkedUser? {
         guard let user = try? JSONDecoder().decode(LinkedUser.self, from: data),
               LinkParser.isValidUserId(user.userId)
         else {
             return nil
         }
-        return user
+        return LinkedUser(userId: user.userId, email: LinkParser.validEmail(user.email))
     }
 
     private func baseQuery() -> [String: Any] {

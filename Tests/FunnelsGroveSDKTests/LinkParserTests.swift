@@ -25,8 +25,11 @@ final class LinkParserTests: XCTestCase {
         }
     }
 
-    func testTakesTheFirstUserId() {
+    func testTakesTheFirstUserIdAndEmail() {
         XCTAssertEqual(user("fgdemo://open?user_id=u_1&user_id=u_2")?.userId, "u_1")
+        XCTAssertEqual(user("fgdemo://open?user_id=u_1&email=a%40b.co&email=c%40d.co")?.email, "a@b.co")
+        // The first email counts even when it cannot be an address.
+        XCTAssertEqual(user("fgdemo://open?user_id=u_1&email=nonsense&email=c%40d.co"), LinkedUser(userId: "u_1"))
     }
 
     func testRejectsMissingOrMalformedUserIds() {
@@ -36,6 +39,8 @@ final class LinkParserTests: XCTestCase {
         XCTAssertNil(user("https://go.example.com/open?User_Id=u_1"))
         XCTAssertNil(user("https://go.example.com/open?user_id=u%201"))
         XCTAssertNil(user("https://go.example.com/open?user_id=u_1%0A"))
+        // NUL is a control character but not whitespace.
+        XCTAssertNil(user("https://go.example.com/open?user_id=u_1%00"))
         XCTAssertNil(user("https://go.example.com/open?user_id=" + String(repeating: "a", count: 257)))
         // One grapheme, 601 UTF-8 bytes: "a" followed by 300 combining acute accents.
         XCTAssertNil(user("https://go.example.com/open?user_id=a" + String(repeating: "%CC%81", count: 300)))
@@ -64,7 +69,11 @@ final class LinkParserTests: XCTestCase {
             "buyer.example.com",
             "a%20b%40example.com",
             "a%0A%40example.com",
+            // A right-to-left override: a control character that is not whitespace.
+            "a%E2%80%AE%40example.com",
             String(repeating: "a", count: 250) + "%40b.co",
+            // 130 characters, 255 UTF-8 bytes.
+            String(repeating: "%C3%BC", count: 125) + "%40b.co",
         ] {
             XCTAssertEqual(user("fgdemo://open?user_id=u_1&email=" + email), LinkedUser(userId: "u_1"), email)
         }

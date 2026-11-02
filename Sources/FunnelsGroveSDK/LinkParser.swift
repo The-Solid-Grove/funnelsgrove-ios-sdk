@@ -4,7 +4,8 @@ enum LinkParser {
     static let maxUserIdLength = 256
     static let maxEmailLength = 254
 
-    /// Returns the buyer a FunnelsGrove link carries, or `nil` when the URL has no valid `user_id`.
+    /// Returns the buyer a FunnelsGrove link carries, or `nil` when the first `user_id` in its query is missing or
+    /// not valid.
     /// Any scheme and host pass: the app's entitlements, its AASA file and its URL types decide which links open it.
     static func user(from url: URL) -> LinkedUser? {
         guard
@@ -23,8 +24,9 @@ enum LinkParser {
         !value.isEmpty && value.utf8.count <= maxUserIdLength && !value.unicodeScalars.contains(where: isForbidden)
     }
 
-    /// The trimmed address if it can be one: at most 254 UTF-8 bytes, an `@`, no whitespace or control characters
-    /// inside. This keeps junk out of the app; it does not prove that the address works or belongs to the user.
+    /// The trimmed value if it passes a loose check: at most 254 UTF-8 bytes, an `@`, no whitespace or control
+    /// characters inside. It keeps blanks, line breaks and invisible characters out of the app, but `@` alone still
+    /// passes, and it does not prove that the address works or belongs to the user.
     static func validEmail(_ value: String?) -> String? {
         guard
             let email = value?.trimmingCharacters(in: .whitespacesAndNewlines),
