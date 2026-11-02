@@ -1642,7 +1642,7 @@ import Foundation
 public struct SubscriptionStatus: Sendable, Equatable {
     /// FunnelsGrove reports an active subscription, and it is either live or test subscriptions are accepted.
     public let isActive: Bool
-    /// The subscription was bought in Stripe test mode.
+    /// An active subscription bought in Stripe test mode. FunnelsGrove reports `false` for an inactive one.
     public let isTest: Bool
     /// FunnelsGrove knows the stored user in this project.
     public let isKnownUser: Bool
@@ -1931,7 +1931,7 @@ paid. Don't log the link, the user ID or the email, or send them to analytics, a
 
 ## Requirements
 
-- iOS 15+, Xcode 16+.
+- iOS 15+, Xcode 16+. macOS is listed in the package only so that `swift test` runs on a Mac; it is not supported.
 - The SDK publishable key of your FunnelsGrove project. Never put a secret key (`sdk_sec_…`) or an organization API
   key (`fg_key_…`) in an app: anyone who downloads it can read the key, so `configure` stops the app if you pass one,
   or an empty key.
@@ -2141,9 +2141,10 @@ same user and clears it for another user.
 
 - **`handle(_:)`** accepts any URL with a `user_id` query parameter (non-empty, at most 256 UTF-8 bytes, no
   whitespace or control characters; the first one counts). It stores the ID together with the link's `email`, and a
-  newer link replaces them. It returns `true` and records no login. Any other URL returns `false` and is left to the
-  app. `userId` and `email` read what is stored. They are plain properties, not observable: copy them into your own
-  state after `handle` returns `true` and after `reset()`.
+  newer link replaces them (a link without an email keeps the address of the same user). It returns `true` and
+  records no login. Any other URL returns `false` and is left to the app. `userId` and `email` read what is stored.
+  They are plain properties, not observable: copy them into your own state after `handle` returns `true` and after
+  `reset()`.
 - **`handle(_ userActivity:)`** uses the activity's `webpageURL` when its type is `NSUserActivityTypeBrowsingWeb`,
   and returns `false` otherwise.
 - **`checkSubscription()`**:
@@ -2176,10 +2177,24 @@ same user and clears it for another user.
   - `.unknownUser`, from `trackLogin()` only: FunnelsGrove has no such user in your project. Don't retry.
   - `.server(statusCode:)` and `.network(URLError)`: try again later.
 
-  Handle the cases you act on and end with `default`: later versions may add cases. The SDK does not cache the
-  subscription answer, so offline every check for a stored user fails with `.network`: decide whether your app keeps
-  the access it last saw or locks paid content. If you keep the last answer, store it with `status.userId` and use it
-  only while `userId` is the same.
+  Handle the cases you act on and end with `default`, as below. If you list every case, end with `@unknown default`
+  instead: a case that a later version adds then shows up as a warning.
+
+  ```swift
+  func message(for error: FunnelsGroveError) -> String {
+      switch error {
+      case .network, .server:
+          return "Can't reach FunnelsGrove. Try again later."
+      default:
+          // .configuration, .unknownUser and cases that later versions add.
+          return "This app can't check your purchase right now."
+      }
+  }
+  ```
+
+  The SDK does not cache the subscription answer, so offline every check for a stored user fails with `.network`:
+  decide whether your app keeps the access it last saw or locks paid content. If you keep the last answer, store it
+  with `status.userId` and use it only while `userId` is the same.
 - **Storage.** The ID and the email live in one keychain item with iCloud Keychain sync. It outlives app deletion in
   practice; Apple does not guarantee that. A reinstall or a new device of the same Apple ID can therefore show the
   previous user's access until a new link arrives. Call `reset()` on sign-out. iCloud Keychain then removes the user
@@ -2519,7 +2534,7 @@ struct ContentView: View {
     private func handlePastedLink() {
         let text = pastedLink.trimmingCharacters(in: .whitespacesAndNewlines)
         guard let url = URL(string: text) else {
-            status = "Ignored: the pasted text is not a URL"
+            log("Ignored: the pasted text is not a URL")
             return
         }
         log("Pasted: \(url.absoluteString)")
@@ -2540,10 +2555,14 @@ struct ContentView: View {
 
     private func linked(_ handled: Bool) {
         guard handled else {
-            status = "Ignored: no valid user_id in the link"
+            // The SDK ignored the link: the stored user and its last answer stay.
+            log("Ignored: no valid user_id in the link")
             return
         }
+        let previous = userId
         refreshUser()
+        // The login result on screen was for another user.
+        if userId != previous { loginStatus = Self.loginHint }
         // A check that already finished saw the previous user: check again.
         Task { await check() }
         // A real app calls trackLogin() here when it has no sign-in of its own, or while the user is signed in
@@ -2708,7 +2727,7 @@ curl -sS -X POST https://sdk-api.funnelsgrove.com/sdk/public/users/verify_subscr
   -H 'Content-Type: application/json' -H "X-SDK-Publishable-Key: $FG_KEY" -d '{"userId":"u_…"}'
 ```
 
-Ожидается `{"active":true,"test":true,"user":{"user_id":"u_…"}}`. Если FG отвечает иначе, проблема в воронке или оплате, а не в SDK. Если вместо этого «Ignored: no valid user_id in the link», в «Last links received» виден полученный URL: проверить, что в нём есть `user_id`.
+Ожидается `{"active":true,"test":true,"user":{"user_id":"u_…"}}`. Если FG отвечает иначе, проблема в воронке или оплате, а не в SDK. Если в «Last links received» после полученного URL стоит «Ignored: no valid user_id in the link», проверить, что в этом URL есть `user_id`.
 
 - [ ] **Step 4: Учёт входа**
 

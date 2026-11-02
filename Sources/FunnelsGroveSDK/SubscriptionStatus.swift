@@ -4,7 +4,7 @@ import Foundation
 public struct SubscriptionStatus: Sendable, Equatable {
     /// FunnelsGrove reports an active subscription, and it is either live or test subscriptions are accepted.
     public let isActive: Bool
-    /// The subscription was bought in Stripe test mode.
+    /// An active subscription bought in Stripe test mode. FunnelsGrove reports `false` for an inactive one.
     public let isTest: Bool
     /// FunnelsGrove knows the stored user in this project.
     public let isKnownUser: Bool

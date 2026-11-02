@@ -97,7 +97,7 @@ struct ContentView: View {
     private func handlePastedLink() {
         let text = pastedLink.trimmingCharacters(in: .whitespacesAndNewlines)
         guard let url = URL(string: text) else {
-            status = "Ignored: the pasted text is not a URL"
+            log("Ignored: the pasted text is not a URL")
             return
         }
         log("Pasted: \(url.absoluteString)")
@@ -118,10 +118,14 @@ struct ContentView: View {
 
     private func linked(_ handled: Bool) {
         guard handled else {
-            status = "Ignored: no valid user_id in the link"
+            // The SDK ignored the link: the stored user and its last answer stay.
+            log("Ignored: no valid user_id in the link")
             return
         }
+        let previous = userId
         refreshUser()
+        // The login result on screen was for another user.
+        if userId != previous { loginStatus = Self.loginHint }
         // A check that already finished saw the previous user: check again.
         Task { await check() }
         // A real app calls trackLogin() here when it has no sign-in of its own, or while the user is signed in
