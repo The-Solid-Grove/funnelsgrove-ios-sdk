@@ -1,0 +1,10 @@
+// Copy to Local.xcconfig (git-ignored) and fill in.
+DEVELOPMENT_TEAM = ABCDE12345
+FG_PUBLISHABLE_KEY = your-funnelsgrove-project-sdk-publishable-key
+// On a device, use a bundle ID that your team can sign:
+// PRODUCT_BUNDLE_IDENTIFIER = com.example.funnelsgrove-demo
+
+// Optional Universal Links: a domain you control whose apple-app-site-association file lists
+// <Team ID>.<bundle ID> for the path /open. Uncomment both lines.
+// FG_DEMO_LINK_HOST = go.example.com
+// CODE_SIGN_ENTITLEMENTS = Config/UniversalLinks.entitlements

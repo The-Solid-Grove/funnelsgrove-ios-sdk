@@ -1,0 +1,9 @@
+// Shared demo settings. Put your own values in Local.xcconfig (git-ignored).
+PRODUCT_BUNDLE_IDENTIFIER = com.funnelsgrove.demo
+FG_PUBLISHABLE_KEY =
+DEVELOPMENT_TEAM =
+// Universal Links are off unless Local.xcconfig sets both (see Local.xcconfig.example).
+FG_DEMO_LINK_HOST =
+CODE_SIGN_ENTITLEMENTS =
+
+#include? "Local.xcconfig"

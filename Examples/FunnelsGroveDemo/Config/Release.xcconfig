@@ -1,0 +1,3 @@
+#include "Shared.xcconfig"
+
+FG_DEMO_LINK_MODE =
