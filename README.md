@@ -47,8 +47,8 @@ published funnel opens your app and that the link carries `user_id`.
 
 Add the package `https://github.com/The-Solid-Grove/funnelsgrove-ios-sdk.git` and link the `FunnelsGroveSDK`
 product. The repository is private: ask the FunnelsGrove team for access, and add the GitHub account that has it in
-Xcode → Settings → Accounts and on your CI. There is no release tag yet: add the package by branch `main` and pin a
-commit (Dependency Rule → Commit) for release builds.
+Xcode → Settings → Accounts and on your CI. There is no release tag yet: add the package by branch `main`, then
+pin a commit (Dependency Rule → Commit) before you release.
 
 ## Links into the app
 
@@ -91,7 +91,8 @@ import SwiftUI
 
 @main
 struct MyApp: App {
-    // false until the first check answers: while it runs, show progress rather than the paywall.
+    // false until the first check answers: while it runs, show progress rather than the paywall (keep your own
+    // checking state).
     @State private var hasAccess = false
 
     init() {
@@ -170,7 +171,8 @@ func scene(_ scene: UIScene, continue userActivity: NSUserActivity) {
 private func linked() {
     // A check that already finished saw the previous user: check again.
     refreshAccess()
-    // This app has no sign-in of its own, so the link is the login: see "App login".
+    // This app has no sign-in of its own, so the link is the login. With your own sign-in, call trackLogin()
+    // here only while the user is signed in: see "App login".
     Task { try? await FunnelsGrove.shared.trackLogin() }
 }
 
@@ -255,9 +257,9 @@ same user and clears it for another user.
   `acceptTestSubscriptions: true` to `configure`. `isTest` is reported either way. Whoever reaches a test-mode funnel
   can pay with Stripe's test card, so a build that accepts test subscriptions gives paid access away. Pass a flag that
   only Debug or a separate QA build configuration sets, for example `acceptTestSubscriptions: isQABuild` with
-  `isQABuild` set under `#if QA`, a condition that only that configuration's Active Compilation Conditions define. A
-  TestFlight build is the binary you then release to the App Store: never accept test subscriptions in it. For App
-  Review, give the reviewers the link of a live-mode user with an active subscription.
+  `isQABuild` set under `#if DEBUG || QA`, where `QA` is in the Active Compilation Conditions of your QA configuration
+  only. Never set it in the configuration you archive for the App Store: its TestFlight build is the binary you then
+  release. For App Review, give the reviewers the link of a live-mode user with an active subscription.
 - **Errors.** Both calls throw `FunnelsGroveError`, or `CancellationError`, which is no result rather than a failure:
   - `.configuration`: FunnelsGrove answered 400 or 401, usually a wrong `publishableKey`. From `trackLogin()`, a 400
     can also mean that the same user ID exists in several funnels of the project: FunnelsGrove then needs a funnel ID
