@@ -1741,10 +1741,11 @@ public final class FunnelsGrove {
 
     /// Asks FunnelsGrove whether the stored user has an active subscription. The answer is not cached.
     ///
-    /// Right after a link an inactive answer is asked again after waits of 1, 2, 4 and 8 seconds, because the payment
-    /// webhook may lag: show progress instead of blocking launch on it. Throws `FunnelsGroveError`, or `CancellationError`
-    /// when the calling task is cancelled (for example a SwiftUI `.task` whose view went away), which is no result
-    /// rather than a failure. If a link or `reset()` arrives meanwhile, the answer is for the current user.
+    /// Right after a link an inactive answer is asked again after waits of 1, 2, 4 and 8 seconds, because the
+    /// payment webhook may lag: show progress instead of blocking launch on it. Throws `FunnelsGroveError`, or
+    /// `CancellationError` when the calling task is cancelled (for example a SwiftUI `.task` whose view went away),
+    /// which is no result rather than a failure. If a link or `reset()` arrives meanwhile, the answer is for the
+    /// current user.
     public func checkSubscription() async throws -> SubscriptionStatus {
         while true {
             guard let checked = userId else {
