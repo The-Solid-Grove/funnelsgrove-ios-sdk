@@ -1139,7 +1139,7 @@ actor FakeFunnelsGrove: FunnelsGroveAPI {
     private(set) var verifiedUserIds: [String] = []
     private(set) var trackedUserIds: [String] = []
 
-    init(answers: [VerifySubscriptionResponse] = []) {
+    init(answers: [VerifySubscriptionResponse]) {
         self.answers = answers
     }
 
@@ -1223,7 +1223,7 @@ final class FunnelsGroveTests: XCTestCase {
 
     // MARK: - Links
 
-    func testHandleStoresTheUserAndEmailWithoutTrackingTheLogin() async {
+    func testHandleStoresTheUserAndEmailWithoutTrackingTheLogin() async throws {
         let (sdk, fake) = makeSDK(answers: [active])
 
         XCTAssertTrue(sdk.handle(link))
@@ -1231,6 +1231,8 @@ final class FunnelsGroveTests: XCTestCase {
         XCTAssertEqual(store.value, LinkedUser(userId: "u_1", email: "buyer@example.com"))
         XCTAssertEqual(sdk.userId, "u_1")
         XCTAssertEqual(sdk.email, "buyer@example.com")
+        // A login sent from a task that handle started would arrive only after handle returns: give it time to.
+        try await Task.sleep(nanoseconds: 100_000_000)
         let tracked = await fake.trackedUserIds
         XCTAssertEqual(tracked, [])
     }
@@ -1314,6 +1316,7 @@ final class FunnelsGroveTests: XCTestCase {
         activity.webpageURL = link
 
         XCTAssertTrue(sdk.handle(activity))
+        XCTAssertEqual(store.value, LinkedUser(userId: "u_1", email: "buyer@example.com"))
         XCTAssertFalse(sdk.handle(NSUserActivity(activityType: "com.funnelsgrove.other")))
     }
 
@@ -1355,13 +1358,18 @@ final class FunnelsGroveTests: XCTestCase {
         XCTAssertEqual(calls, [])
     }
 
-    func testCheckReportsALiveSubscription() async throws {
+    func testCheckReportsALiveSubscriptionWithoutCachingIt() async throws {
         store.value = LinkedUser(userId: "u_1")
-        let (sdk, _) = makeSDK(answers: [active])
+        // The subscription ends between the two checks: a cached answer would still say active.
+        let (sdk, fake) = makeSDK(answers: [active, inactive])
 
-        let status = try await sdk.checkSubscription()
+        let first = try await sdk.checkSubscription()
+        let second = try await sdk.checkSubscription()
 
-        XCTAssertEqual(status, SubscriptionStatus(isActive: true, isTest: false, isKnownUser: true, userId: "u_1"))
+        XCTAssertEqual(first, SubscriptionStatus(isActive: true, isTest: false, isKnownUser: true, userId: "u_1"))
+        XCTAssertEqual(second, SubscriptionStatus(isActive: false, isTest: false, isKnownUser: true, userId: "u_1"))
+        let calls = await fake.verifiedUserIds
+        XCTAssertEqual(calls, ["u_1", "u_1"])
     }
 
     func testCheckRejectsTestSubscriptionsByDefault() async throws {
@@ -1679,7 +1687,8 @@ public final class FunnelsGrove {
         return instance
     }
 
-    /// Call once at launch, before any link can arrive.
+    /// Call once at launch, before any link can arrive. Stops the app when `publishableKey` is empty, contains
+    /// whitespace, or starts with `sdk_sec_` or `fg_key_`.
     /// - Parameters:
     ///   - publishableKey: The SDK publishable key of your FunnelsGrove project. Never a secret key.
     ///   - acceptTestSubscriptions: Treat Stripe test-mode subscriptions as active. Use only in QA builds.
@@ -1734,7 +1743,8 @@ public final class FunnelsGrove {
         self.sleep = sleep
     }
 
-    /// The FunnelsGrove user ID from the latest link, if any.
+    /// The FunnelsGrove user ID from the latest link, if any. A plain property, not observable: read it again after
+    /// `handle` returns `true` and after `reset()`.
     public var userId: String? { user?.userId }
 
     /// The email the links carried for the stored user, if any. Not verified: it is the address the buyer typed in
@@ -1750,6 +1760,7 @@ public final class FunnelsGrove {
 
     /// Stores the user ID and email from a FunnelsGrove link: any URL, whatever its scheme and host, with a valid
     /// `user_id`. Returns `false` for any other URL, which the app handles itself; route your own links first.
+    /// A link without a usable `email` keeps the stored email of the same user and clears another user's.
     /// After `true`, call `checkSubscription()` again: a check that already finished saw the previous user.
     /// No login is recorded: call `trackLogin()` when your app signs the user in.
     @discardableResult
@@ -1777,9 +1788,10 @@ public final class FunnelsGrove {
         return handle(url)
     }
 
-    /// Asks FunnelsGrove whether the stored user has an active subscription. The answer is not cached.
+    /// Asks FunnelsGrove whether the stored user has an active subscription. The answer is not cached. Without a
+    /// stored user it answers `isActive: false` and `userId: nil` without a network call.
     ///
-    /// Right after a link an inactive answer is asked again after waits of 1, 2, 4 and 8 seconds, because the
+    /// Within 2 minutes of a link an inactive answer is asked again after waits of 1, 2, 4 and 8 seconds, because the
     /// payment webhook may lag: show progress instead of blocking launch on it. Throws `FunnelsGroveError`, or
     /// `CancellationError` when the calling task is cancelled (for example a SwiftUI `.task` whose view went away),
     /// which is no result rather than a failure. If a link or `reset()` arrives meanwhile, the answer is for the
@@ -1826,7 +1838,8 @@ public final class FunnelsGrove {
         return true
     }
 
-    /// Forgets the stored user and email on this device and, through iCloud Keychain, on the user's other devices.
+    /// Forgets the stored user and email. iCloud Keychain removes them from the user's other devices too, where the
+    /// app forgets the user from its next launch.
     public func reset() {
         store.delete()
         cachedUser = nil
@@ -1837,8 +1850,11 @@ public final class FunnelsGrove {
     private func keep(_ user: LinkedUser) {
         do {
             try store.save(user)
+        } catch let error as KeychainError {
+            logger.error("Keeping the user failed: \(error.description, privacy: .public)")
         } catch {
-            logger.error("Keeping the user failed: \(String(describing: error), privacy: .public)")
+            // Only a keychain status is known to carry no user data.
+            logger.error("Keeping the user failed: \(String(describing: error), privacy: .private)")
         }
         cachedUser = user
         logger.info("Linked FunnelsGrove user \(user.userId, privacy: .private)")
@@ -1857,7 +1873,7 @@ public final class FunnelsGrove {
 cd /Users/e/work2/appsilove/funnelsgrove-ios-sdk && swift test 2>&1 | grep -E "warning:|error:|Executed 65"
 ```
 
-Ожидается: одна строка `Executed 65 tests, with 0 failures`, без `warning:` и `error:`.
+Ожидается: `Executed 65 tests, with 0 failures` (XCTest печатает эту строку дважды: для бандла и для «All tests»), без `warning:` и `error:`.
 
 - [ ] **Step 7: Убедиться, что тесты проходят на iOS-симуляторе**
 
@@ -2071,7 +2087,8 @@ link has it. A newer link without an email keeps the address of the same user an
 - **`handle(_:)`** accepts any URL with a `user_id` query parameter (non-empty, at most 256 UTF-8 bytes, no
   whitespace or control characters; the first one counts). It stores the ID together with the link's `email`, and a
   newer link replaces them. It returns `true` and records no login. Any other URL returns `false` and is left to the
-  app. `userId` and `email` read what is stored.
+  app. `userId` and `email` read what is stored. They are plain properties, not observable: copy them into your own
+  state after `handle` returns `true` and after `reset()`.
 - **`handle(_ activity:)`** uses the activity's `webpageURL` when its type is `NSUserActivityTypeBrowsingWeb`, and
   returns `false` otherwise.
 - **`checkSubscription()`**:
@@ -2098,8 +2115,8 @@ link has it. A newer link without an email keeps the address of the same user an
   the access it last saw or locks paid content.
 - **Storage.** The ID and the email live in one keychain item with iCloud Keychain sync. It outlives app deletion in
   practice; Apple does not guarantee that. A reinstall or a new device of the same Apple ID can therefore show the
-  previous user's access until a new link arrives. Call `reset()` on sign-out; other devices drop the user once
-  iCloud Keychain syncs.
+  previous user's access until a new link arrives. Call `reset()` on sign-out; iCloud Keychain then removes the user
+  from other devices, where the app forgets it from its next launch.
 
 ## Testing a link
 
@@ -2400,7 +2417,7 @@ struct ContentView: View {
             linked(FunnelsGrove.shared.handle(url))
         }
         .onChange(of: scenePhase) { _, phase in
-            // iCloud Keychain may deliver the user while the app is in the background.
+            // iCloud Keychain may deliver a user in the background; the SDK reads it while it has none.
             if phase == .active { refreshUser() }
         }
     }

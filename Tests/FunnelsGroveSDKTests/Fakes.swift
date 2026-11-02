@@ -23,7 +23,7 @@ actor FakeFunnelsGrove: FunnelsGroveAPI {
     private(set) var verifiedUserIds: [String] = []
     private(set) var trackedUserIds: [String] = []
 
-    init(answers: [VerifySubscriptionResponse] = []) {
+    init(answers: [VerifySubscriptionResponse]) {
         self.answers = answers
     }
 

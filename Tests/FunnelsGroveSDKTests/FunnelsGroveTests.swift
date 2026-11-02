@@ -39,7 +39,7 @@ final class FunnelsGroveTests: XCTestCase {
 
     // MARK: - Links
 
-    func testHandleStoresTheUserAndEmailWithoutTrackingTheLogin() async {
+    func testHandleStoresTheUserAndEmailWithoutTrackingTheLogin() async throws {
         let (sdk, fake) = makeSDK(answers: [active])
 
         XCTAssertTrue(sdk.handle(link))
@@ -47,6 +47,8 @@ final class FunnelsGroveTests: XCTestCase {
         XCTAssertEqual(store.value, LinkedUser(userId: "u_1", email: "buyer@example.com"))
         XCTAssertEqual(sdk.userId, "u_1")
         XCTAssertEqual(sdk.email, "buyer@example.com")
+        // A login sent from a task that handle started would arrive only after handle returns: give it time to.
+        try await Task.sleep(nanoseconds: 100_000_000)
         let tracked = await fake.trackedUserIds
         XCTAssertEqual(tracked, [])
     }
@@ -130,6 +132,7 @@ final class FunnelsGroveTests: XCTestCase {
         activity.webpageURL = link
 
         XCTAssertTrue(sdk.handle(activity))
+        XCTAssertEqual(store.value, LinkedUser(userId: "u_1", email: "buyer@example.com"))
         XCTAssertFalse(sdk.handle(NSUserActivity(activityType: "com.funnelsgrove.other")))
     }
 
@@ -171,13 +174,18 @@ final class FunnelsGroveTests: XCTestCase {
         XCTAssertEqual(calls, [])
     }
 
-    func testCheckReportsALiveSubscription() async throws {
+    func testCheckReportsALiveSubscriptionWithoutCachingIt() async throws {
         store.value = LinkedUser(userId: "u_1")
-        let (sdk, _) = makeSDK(answers: [active])
+        // The subscription ends between the two checks: a cached answer would still say active.
+        let (sdk, fake) = makeSDK(answers: [active, inactive])
 
-        let status = try await sdk.checkSubscription()
+        let first = try await sdk.checkSubscription()
+        let second = try await sdk.checkSubscription()
 
-        XCTAssertEqual(status, SubscriptionStatus(isActive: true, isTest: false, isKnownUser: true, userId: "u_1"))
+        XCTAssertEqual(first, SubscriptionStatus(isActive: true, isTest: false, isKnownUser: true, userId: "u_1"))
+        XCTAssertEqual(second, SubscriptionStatus(isActive: false, isTest: false, isKnownUser: true, userId: "u_1"))
+        let calls = await fake.verifiedUserIds
+        XCTAssertEqual(calls, ["u_1", "u_1"])
     }
 
     func testCheckRejectsTestSubscriptionsByDefault() async throws {

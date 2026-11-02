@@ -24,7 +24,8 @@ public final class FunnelsGrove {
         return instance
     }
 
-    /// Call once at launch, before any link can arrive.
+    /// Call once at launch, before any link can arrive. Stops the app when `publishableKey` is empty, contains
+    /// whitespace, or starts with `sdk_sec_` or `fg_key_`.
     /// - Parameters:
     ///   - publishableKey: The SDK publishable key of your FunnelsGrove project. Never a secret key.
     ///   - acceptTestSubscriptions: Treat Stripe test-mode subscriptions as active. Use only in QA builds.
@@ -79,7 +80,8 @@ public final class FunnelsGrove {
         self.sleep = sleep
     }
 
-    /// The FunnelsGrove user ID from the latest link, if any.
+    /// The FunnelsGrove user ID from the latest link, if any. A plain property, not observable: read it again after
+    /// `handle` returns `true` and after `reset()`.
     public var userId: String? { user?.userId }
 
     /// The email the links carried for the stored user, if any. Not verified: it is the address the buyer typed in
@@ -95,6 +97,7 @@ public final class FunnelsGrove {
 
     /// Stores the user ID and email from a FunnelsGrove link: any URL, whatever its scheme and host, with a valid
     /// `user_id`. Returns `false` for any other URL, which the app handles itself; route your own links first.
+    /// A link without a usable `email` keeps the stored email of the same user and clears another user's.
     /// After `true`, call `checkSubscription()` again: a check that already finished saw the previous user.
     /// No login is recorded: call `trackLogin()` when your app signs the user in.
     @discardableResult
@@ -122,9 +125,10 @@ public final class FunnelsGrove {
         return handle(url)
     }
 
-    /// Asks FunnelsGrove whether the stored user has an active subscription. The answer is not cached.
+    /// Asks FunnelsGrove whether the stored user has an active subscription. The answer is not cached. Without a
+    /// stored user it answers `isActive: false` and `userId: nil` without a network call.
     ///
-    /// Right after a link an inactive answer is asked again after waits of 1, 2, 4 and 8 seconds, because the
+    /// Within 2 minutes of a link an inactive answer is asked again after waits of 1, 2, 4 and 8 seconds, because the
     /// payment webhook may lag: show progress instead of blocking launch on it. Throws `FunnelsGroveError`, or
     /// `CancellationError` when the calling task is cancelled (for example a SwiftUI `.task` whose view went away),
     /// which is no result rather than a failure. If a link or `reset()` arrives meanwhile, the answer is for the
@@ -171,7 +175,8 @@ public final class FunnelsGrove {
         return true
     }
 
-    /// Forgets the stored user and email on this device and, through iCloud Keychain, on the user's other devices.
+    /// Forgets the stored user and email. iCloud Keychain removes them from the user's other devices too, where the
+    /// app forgets the user from its next launch.
     public func reset() {
         store.delete()
         cachedUser = nil
@@ -182,8 +187,11 @@ public final class FunnelsGrove {
     private func keep(_ user: LinkedUser) {
         do {
             try store.save(user)
+        } catch let error as KeychainError {
+            logger.error("Keeping the user failed: \(error.description, privacy: .public)")
         } catch {
-            logger.error("Keeping the user failed: \(String(describing: error), privacy: .public)")
+            // Only a keychain status is known to carry no user data.
+            logger.error("Keeping the user failed: \(String(describing: error), privacy: .private)")
         }
         cachedUser = user
         logger.info("Linked FunnelsGrove user \(user.userId, privacy: .private)")
