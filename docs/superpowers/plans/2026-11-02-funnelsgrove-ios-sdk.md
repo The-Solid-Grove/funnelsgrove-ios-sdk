@@ -29,7 +29,7 @@
   - тестовый FG-проект с опубликованной воронкой и его publishable key;
   - для задачи 8 — iPhone.
 - **Проверка кода.** Код прогнан в scratch-копии 2 ноября:
-  - после каждой задачи собирается и проходит своё число тестов, в конце 64 теста на macOS (`swift test`) и на iOS-симуляторе (`xcodebuild test`), без предупреждений в Swift 6 language mode;
+  - после каждой задачи собирается и проходит своё число тестов, в конце 65 тестов на macOS (`swift test`) и на iOS-симуляторе (`xcodebuild test`), без предупреждений в Swift 6 language mode;
   - демо-приложение собирается без подписи; на симуляторе ссылка `fgdemo://open?user_id=u_sim_check&email=buyer%2Bqa%40example.com` из Safari сохраняет `u_sim_check` и `buyer+qa@example.com`;
   - примеры кода из README компилируются против iOS SDK.
 - **Keychain юнит-тестами не покрывается.** Неподписанный тестовый бандл получает `errSecMissingEntitlement` (-34018) и на macOS, и на симуляторе, это проверено для AppsiloveSDK. Юнит-тесты проверяют формат записи и логику на фейке, реальное хранение — задачи 7 и 8 на подписанном демо-приложении.
@@ -567,6 +567,7 @@ final class FunnelsGroveClientTests: XCTestCase {
         let request = try XCTUnwrap(StubURLProtocol.requests.first)
         XCTAssertEqual(request.url?.absoluteString, "https://sdk-api.example.com/sdk/public/users/verify_subscription")
         XCTAssertEqual(request.httpMethod, "POST")
+        XCTAssertEqual(request.timeoutInterval, 10)
         XCTAssertEqual(request.value(forHTTPHeaderField: "Content-Type"), "application/json")
         XCTAssertEqual(request.value(forHTTPHeaderField: "X-SDK-Publishable-Key"), "pk_test")
         XCTAssertEqual(request.jsonBody(), ["userId": "u_1"])
@@ -591,13 +592,22 @@ final class FunnelsGroveClientTests: XCTestCase {
     }
 
     func testVerifyMapsOtherStatusesToServer() async {
-        for status in [404, 500] {
-            StubURLProtocol.respond(status, json: "{}")
+        // The status wins over a readable body, and only a 503 is retried, whatever Retry-After says.
+        for status in [300, 403, 404, 429, 500] {
+            StubURLProtocol.reset()
+            StubURLProtocol.respond(
+                status,
+                json: #"{"active":true,"test":false,"user":{"user_id":"u_1"}}"#,
+                headers: ["Retry-After": "1"]
+            )
 
-            await assertThrows(.server(statusCode: status)) {
+            await assertThrows(.server(statusCode: status), message: "\(status)") {
                 _ = try await self.client.verifySubscription(userId: "u_1")
             }
+            XCTAssertEqual(StubURLProtocol.requests.count, 1, "\(status)")
         }
+        let delays = await sleeps.delays
+        XCTAssertEqual(delays, [])
     }
 
     func testVerifyMapsAnUnreadableBodyToServer() async {
@@ -609,26 +619,30 @@ final class FunnelsGroveClientTests: XCTestCase {
     }
 
     func testVerifyRetriesOnceAfterAShort503() async throws {
-        StubURLProtocol.respond(503, json: "{}", headers: ["Retry-After": "2"])
-        StubURLProtocol.respond(200, json: #"{"active":true,"test":false,"user":{"user_id":"u_1"}}"#)
+        for retryAfter in ["0", "10"] {
+            StubURLProtocol.reset()
+            StubURLProtocol.respond(503, json: "{}", headers: ["Retry-After": retryAfter])
+            StubURLProtocol.respond(200, json: #"{"active":true,"test":false,"user":{"user_id":"u_1"}}"#)
 
-        let response = try await client.verifySubscription(userId: "u_1")
+            let response = try await client.verifySubscription(userId: "u_1")
 
-        XCTAssertTrue(response.active)
-        XCTAssertEqual(StubURLProtocol.requests.count, 2)
+            XCTAssertTrue(response.active, retryAfter)
+            XCTAssertEqual(StubURLProtocol.requests.count, 2, retryAfter)
+        }
         let delays = await sleeps.delays
-        XCTAssertEqual(delays, [2])
+        XCTAssertEqual(delays, [0, 10])
     }
 
     func testVerifyReportsA503ThatAsksToWaitTooLongOrNamesNoUsableWait() async {
-        for retryAfter in ["30", "-1", "Wed, 21 Oct 2026 07:28:00 GMT"] {
+        for retryAfter in ["11", "-1", "Wed, 21 Oct 2026 07:28:00 GMT", nil] {
+            let label = retryAfter ?? "no Retry-After"
             StubURLProtocol.reset()
-            StubURLProtocol.respond(503, json: "{}", headers: ["Retry-After": retryAfter])
+            StubURLProtocol.respond(503, json: "{}", headers: retryAfter.map { ["Retry-After": $0] } ?? [:])
 
-            await assertThrows(.server(statusCode: 503), message: retryAfter) {
+            await assertThrows(.server(statusCode: 503), message: label) {
                 _ = try await self.client.verifySubscription(userId: "u_1")
             }
-            XCTAssertEqual(StubURLProtocol.requests.count, 1, retryAfter)
+            XCTAssertEqual(StubURLProtocol.requests.count, 1, label)
         }
         let delays = await sleeps.delays
         XCTAssertEqual(delays, [])
@@ -684,15 +698,18 @@ final class FunnelsGroveClientTests: XCTestCase {
         let request = try XCTUnwrap(StubURLProtocol.requests.first)
         XCTAssertEqual(request.url?.absoluteString, "https://sdk-api.example.com/sdk/public/users/track_login")
         XCTAssertEqual(request.httpMethod, "POST")
+        XCTAssertEqual(request.timeoutInterval, 10)
         XCTAssertEqual(request.value(forHTTPHeaderField: "Content-Type"), "application/json")
         XCTAssertEqual(request.value(forHTTPHeaderField: "X-SDK-Publishable-Key"), "pk_test")
         XCTAssertEqual(request.jsonBody(), ["userId": "u_1"])
     }
 
     func testTrackLoginIgnoresTheResponseBody() async throws {
-        StubURLProtocol.respond(200, json: "not json")
+        for (status, body) in [(200, "not json"), (204, "")] {
+            StubURLProtocol.respond(status, json: body)
 
-        try await client.trackLogin(userId: "u_1")
+            try await client.trackLogin(userId: "u_1")
+        }
     }
 
     func testTrackLoginRetriesOnceAfterAShort503() async throws {
@@ -1150,7 +1167,8 @@ final class FunnelsGroveTests: XCTestCase {
 
     private func makeSDK(
         answers: [VerifySubscriptionResponse],
-        acceptTestSubscriptions: Bool = false
+        acceptTestSubscriptions: Bool = false,
+        sleep: Sleep? = nil
     ) -> (FunnelsGrove, FakeFunnelsGrove) {
         let fake = FakeFunnelsGrove(answers: answers)
         let clock = clock
@@ -1160,7 +1178,7 @@ final class FunnelsGroveTests: XCTestCase {
             store: store,
             client: fake,
             now: { clock.now },
-            sleep: { await sleeps.record($0) }
+            sleep: sleep ?? { await sleeps.record($0) }
         )
         return (sdk, fake)
     }
@@ -1397,6 +1415,22 @@ final class FunnelsGroveTests: XCTestCase {
         } catch {
             XCTAssertEqual(error as? FunnelsGroveError, .server(statusCode: 500))
         }
+    }
+
+    func testCheckReportsCancellationWhilePolling() async {
+        // Task.sleep throws CancellationError when the calling task is cancelled.
+        let (sdk, fake) = makeSDK(answers: [inactive], sleep: { _ in throw CancellationError() })
+        sdk.handle(link)
+
+        do {
+            _ = try await sdk.checkSubscription()
+            XCTFail("Expected cancellation")
+        } catch is CancellationError {
+        } catch {
+            XCTFail("Unexpected error \(error)")
+        }
+        let calls = await fake.verifiedUserIds
+        XCTAssertEqual(calls.count, 1)
     }
 
     func testCheckAnswersForALinkThatArrivedDuringTheRequest() async throws {
@@ -1707,8 +1741,8 @@ public final class FunnelsGrove {
 
     /// Asks FunnelsGrove whether the stored user has an active subscription. The answer is not cached.
     ///
-    /// Right after a link an inactive answer is polled for up to about 15 seconds, because the payment webhook
-    /// may lag: show progress instead of blocking launch on it. Throws `FunnelsGroveError`, or `CancellationError`
+    /// Right after a link an inactive answer is asked again after waits of 1, 2, 4 and 8 seconds, because the payment
+    /// webhook may lag: show progress instead of blocking launch on it. Throws `FunnelsGroveError`, or `CancellationError`
     /// when the calling task is cancelled (for example a SwiftUI `.task` whose view went away), which is no result
     /// rather than a failure. If a link or `reset()` arrives meanwhile, the answer is for the current user.
     public func checkSubscription() async throws -> SubscriptionStatus {
@@ -1781,10 +1815,10 @@ public final class FunnelsGrove {
 - [ ] **Step 6: Убедиться, что тесты проходят на macOS**
 
 ```bash
-cd /Users/e/work2/appsilove/funnelsgrove-ios-sdk && swift test 2>&1 | grep -E "warning:|error:|Executed 64"
+cd /Users/e/work2/appsilove/funnelsgrove-ios-sdk && swift test 2>&1 | grep -E "warning:|error:|Executed 65"
 ```
 
-Ожидается: одна строка `Executed 64 tests, with 0 failures`, без `warning:` и `error:`.
+Ожидается: одна строка `Executed 65 tests, with 0 failures`, без `warning:` и `error:`.
 
 - [ ] **Step 7: Убедиться, что тесты проходят на iOS-симуляторе**
 
@@ -1792,10 +1826,10 @@ cd /Users/e/work2/appsilove/funnelsgrove-ios-sdk && swift test 2>&1 | grep -E "w
 cd /Users/e/work2/appsilove/funnelsgrove-ios-sdk
 DEVICE_ID=$(xcrun simctl list devices available | grep -m1 -E '^\s+iPhone' | grep -oE '[0-9A-F-]{36}')
 : "${DEVICE_ID:?no available iPhone simulator}"
-xcodebuild test -scheme FunnelsGroveSDK -destination "platform=iOS Simulator,id=$DEVICE_ID" 2>&1 | grep -E "error:|Executed 64|TEST (SUCCEEDED|FAILED)"
+xcodebuild test -scheme FunnelsGroveSDK -destination "platform=iOS Simulator,id=$DEVICE_ID" 2>&1 | grep -E "error:|Executed 65|TEST (SUCCEEDED|FAILED)"
 ```
 
-Ожидается: `Executed 64 tests, with 0 failures` и `** TEST SUCCEEDED **`. Строка `appintentsmetadataprocessor … warning: Metadata extraction skipped` — шум `xcodebuild`, не от пакета.
+Ожидается: `Executed 65 tests, with 0 failures` и `** TEST SUCCEEDED **`. Строка `appintentsmetadataprocessor … warning: Metadata extraction skipped` — шум `xcodebuild`, не от пакета.
 
 - [ ] **Step 8: Commit**
 
@@ -2003,7 +2037,7 @@ link has it. A newer link without an email keeps the address of the same user an
   returns `false` otherwise.
 - **`checkSubscription()`**:
   - without a stored ID returns at once, without a network call;
-  - within 2 minutes of a link keeps asking for up to ~15 s while FunnelsGrove still says inactive, because the
+  - within 2 minutes of a link asks again after 1, 2, 4 and 8 s while FunnelsGrove still says inactive, because the
     payment webhook may lag: show progress instead of blocking launch on it;
   - retries a 503 once when `Retry-After` is 10 s or less;
   - answers `isKnownUser: false` when FunnelsGrove does not know the stored ID in your project, for example after a

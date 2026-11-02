@@ -27,6 +27,7 @@ final class FunnelsGroveClientTests: XCTestCase {
         let request = try XCTUnwrap(StubURLProtocol.requests.first)
         XCTAssertEqual(request.url?.absoluteString, "https://sdk-api.example.com/sdk/public/users/verify_subscription")
         XCTAssertEqual(request.httpMethod, "POST")
+        XCTAssertEqual(request.timeoutInterval, 10)
         XCTAssertEqual(request.value(forHTTPHeaderField: "Content-Type"), "application/json")
         XCTAssertEqual(request.value(forHTTPHeaderField: "X-SDK-Publishable-Key"), "pk_test")
         XCTAssertEqual(request.jsonBody(), ["userId": "u_1"])
@@ -51,13 +52,22 @@ final class FunnelsGroveClientTests: XCTestCase {
     }
 
     func testVerifyMapsOtherStatusesToServer() async {
-        for status in [404, 500] {
-            StubURLProtocol.respond(status, json: "{}")
+        // The status wins over a readable body, and only a 503 is retried, whatever Retry-After says.
+        for status in [300, 403, 404, 429, 500] {
+            StubURLProtocol.reset()
+            StubURLProtocol.respond(
+                status,
+                json: #"{"active":true,"test":false,"user":{"user_id":"u_1"}}"#,
+                headers: ["Retry-After": "1"]
+            )
 
-            await assertThrows(.server(statusCode: status)) {
+            await assertThrows(.server(statusCode: status), message: "\(status)") {
                 _ = try await self.client.verifySubscription(userId: "u_1")
             }
+            XCTAssertEqual(StubURLProtocol.requests.count, 1, "\(status)")
         }
+        let delays = await sleeps.delays
+        XCTAssertEqual(delays, [])
     }
 
     func testVerifyMapsAnUnreadableBodyToServer() async {
@@ -69,26 +79,30 @@ final class FunnelsGroveClientTests: XCTestCase {
     }
 
     func testVerifyRetriesOnceAfterAShort503() async throws {
-        StubURLProtocol.respond(503, json: "{}", headers: ["Retry-After": "2"])
-        StubURLProtocol.respond(200, json: #"{"active":true,"test":false,"user":{"user_id":"u_1"}}"#)
+        for retryAfter in ["0", "10"] {
+            StubURLProtocol.reset()
+            StubURLProtocol.respond(503, json: "{}", headers: ["Retry-After": retryAfter])
+            StubURLProtocol.respond(200, json: #"{"active":true,"test":false,"user":{"user_id":"u_1"}}"#)
 
-        let response = try await client.verifySubscription(userId: "u_1")
+            let response = try await client.verifySubscription(userId: "u_1")
 
-        XCTAssertTrue(response.active)
-        XCTAssertEqual(StubURLProtocol.requests.count, 2)
+            XCTAssertTrue(response.active, retryAfter)
+            XCTAssertEqual(StubURLProtocol.requests.count, 2, retryAfter)
+        }
         let delays = await sleeps.delays
-        XCTAssertEqual(delays, [2])
+        XCTAssertEqual(delays, [0, 10])
     }
 
     func testVerifyReportsA503ThatAsksToWaitTooLongOrNamesNoUsableWait() async {
-        for retryAfter in ["30", "-1", "Wed, 21 Oct 2026 07:28:00 GMT"] {
+        for retryAfter in ["11", "-1", "Wed, 21 Oct 2026 07:28:00 GMT", nil] {
+            let label = retryAfter ?? "no Retry-After"
             StubURLProtocol.reset()
-            StubURLProtocol.respond(503, json: "{}", headers: ["Retry-After": retryAfter])
+            StubURLProtocol.respond(503, json: "{}", headers: retryAfter.map { ["Retry-After": $0] } ?? [:])
 
-            await assertThrows(.server(statusCode: 503), message: retryAfter) {
+            await assertThrows(.server(statusCode: 503), message: label) {
                 _ = try await self.client.verifySubscription(userId: "u_1")
             }
-            XCTAssertEqual(StubURLProtocol.requests.count, 1, retryAfter)
+            XCTAssertEqual(StubURLProtocol.requests.count, 1, label)
         }
         let delays = await sleeps.delays
         XCTAssertEqual(delays, [])
@@ -144,15 +158,18 @@ final class FunnelsGroveClientTests: XCTestCase {
         let request = try XCTUnwrap(StubURLProtocol.requests.first)
         XCTAssertEqual(request.url?.absoluteString, "https://sdk-api.example.com/sdk/public/users/track_login")
         XCTAssertEqual(request.httpMethod, "POST")
+        XCTAssertEqual(request.timeoutInterval, 10)
         XCTAssertEqual(request.value(forHTTPHeaderField: "Content-Type"), "application/json")
         XCTAssertEqual(request.value(forHTTPHeaderField: "X-SDK-Publishable-Key"), "pk_test")
         XCTAssertEqual(request.jsonBody(), ["userId": "u_1"])
     }
 
     func testTrackLoginIgnoresTheResponseBody() async throws {
-        StubURLProtocol.respond(200, json: "not json")
+        for (status, body) in [(200, "not json"), (204, "")] {
+            StubURLProtocol.respond(status, json: body)
 
-        try await client.trackLogin(userId: "u_1")
+            try await client.trackLogin(userId: "u_1")
+        }
     }
 
     func testTrackLoginRetriesOnceAfterAShort503() async throws {
