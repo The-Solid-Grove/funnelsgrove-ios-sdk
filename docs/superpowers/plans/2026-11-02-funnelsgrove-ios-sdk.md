@@ -1,0 +1,2527 @@
+# FunnelsGroveSDK для iOS: план реализации
+
+> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+
+**Goal:** Swift Package `FunnelsGroveSDK` принимает ссылку из воронки FunnelsGrove с любого домена и с любой схемой, хранит `user_id` и `email` из неё в Keychain, проверяет подписку и по вызову приложения записывает «Logged into app». Демо-приложение проверяет всю цепочку на устройстве.
+
+**Architecture:**
+- Публичный API — `@MainActor` фасад `FunnelsGrove` над тремя внутренними частями:
+  - `LinkParser` достаёт из ссылки `LinkedUser` (`user_id` и `email`);
+  - `UserStore` хранит `LinkedUser` одной записью Keychain с синком через iCloud;
+  - `FunnelsGroveClient` вызывает `verify_subscription` и `track_login` с publishable key.
+- Код перенесён из AppsiloveSDK с правками: без `linkHost`, страницы управления и входа по коду, с email из ссылки и публичным `trackLogin()`.
+- Зависимости передаются через internal init, поэтому тесты работают на фейках и на `URLProtocol`-стабе.
+- Демо-приложение генерируется XcodeGen и подключает пакет как локальный.
+
+**Tech Stack:** Swift 6.3.3 (Xcode 26.6), `swift-tools-version: 6.0`, XCTest, XcodeGen 2.46.
+
+**Spec:** [docs/superpowers/specs/2026-11-02-funnelsgrove-ios-sdk-design.md](../specs/2026-11-02-funnelsgrove-ios-sdk-design.md)
+
+---
+
+## Перед началом
+
+- **Где работать.** Репозиторий `/Users/e/work2/appsilove/funnelsgrove-ios-sdk`, ветка `feat/sdk-prototype`. В ней пока один коммит со спекой (`b75bc0e`), ветки `main` нет ни локально, ни на GitHub (`git@github.com:The-Solid-Grove/funnelsgrove-ios-sdk.git`, репозиторий приватный и пустой). Вся работа идёт в `feat/sdk-prototype`. Push не делаем, его решает владелец (задача 8, шаг 7).
+- **Источник.** AppsiloveSDK лежит в `/Users/e/work2/appsilove/appsilove-ios-sdk`. Весь код ниже приведён целиком, копировать оттуда ничего не нужно.
+- **Задачи 1–6 и шаги 1–9 задачи 7** выполняются локально без доступов.
+- **Шаг 10 задачи 7 и задача 8 требуют участия владельца:**
+  - Apple Team ID и подпись в Xcode;
+  - тестовый FG-проект с опубликованной воронкой и его publishable key;
+  - для задачи 8 — iPhone.
+- **Проверка кода.** Код прогнан в scratch-копии 2 ноября:
+  - после каждой задачи собирается и проходит своё число тестов, в конце 64 теста на macOS (`swift test`) и на iOS-симуляторе (`xcodebuild test`), без предупреждений в Swift 6 language mode;
+  - демо-приложение собирается без подписи; на симуляторе ссылка `fgdemo://open?user_id=u_sim_check&email=buyer%2Bqa%40example.com` из Safari сохраняет `u_sim_check` и `buyer+qa@example.com`;
+  - примеры кода из README компилируются против iOS SDK.
+- **Keychain юнит-тестами не покрывается.** Неподписанный тестовый бандл получает `errSecMissingEntitlement` (-34018) и на macOS, и на симуляторе, это проверено для AppsiloveSDK. Юнит-тесты проверяют формат записи и логику на фейке, реальное хранение — задачи 7 и 8 на подписанном демо-приложении.
+
+## Карта файлов
+
+| Файл | Ответственность |
+| --- | --- |
+| `Package.swift` | Пакет `FunnelsGroveSDK`: iOS 15+, macOS 12 для `swift test` |
+| `Sources/FunnelsGroveSDK/FunnelsGroveError.swift` | Публичные ошибки |
+| `Sources/FunnelsGroveSDK/LinkedUser.swift` | `user_id` и `email` покупателя, формат записи в Keychain |
+| `Sources/FunnelsGroveSDK/LinkParser.swift` | Ссылка → `LinkedUser` или `nil`, правила для `user_id` и `email` |
+| `Sources/FunnelsGroveSDK/FunnelsGroveClient.swift` | HTTP-клиент FG: `verify_subscription`, `track_login`, повтор на 503, маппинг ошибок |
+| `Sources/FunnelsGroveSDK/UserStore.swift` | Протокол хранилища и реализация на Keychain |
+| `Sources/FunnelsGroveSDK/SubscriptionStatus.swift` | Публичный результат проверки |
+| `Sources/FunnelsGroveSDK/FunnelsGrove.swift` | Фасад: `configure`, `shared`, `handle`, `userId`, `email`, `checkSubscription`, `trackLogin`, `reset` |
+| `Tests/FunnelsGroveSDKTests/*.swift` | Тесты и тестовые дублёры |
+| `README.md` | Подключение SDK, настройка FG-проекта, поведение, демо, тесты |
+| `Examples/FunnelsGroveDemo/…` | Демо-приложение: XcodeGen `project.yml`, xcconfig-файлы, entitlements для Universal Links, исходники SwiftUI |
+
+---
+
+### Task 1: Каркас пакета
+
+**Files:**
+- Create: `Package.swift`
+- Create: `.gitignore`
+- Create: `Sources/FunnelsGroveSDK/FunnelsGroveError.swift`
+- Create: `Tests/FunnelsGroveSDKTests/.gitkeep`
+
+- [ ] **Step 1: Проверить ветку**
+
+```bash
+cd /Users/e/work2/appsilove/funnelsgrove-ios-sdk && git branch --show-current && git log --oneline
+```
+
+Ожидается: `feat/sdk-prototype` и один коммит `b75bc0e docs: design the FunnelsGrove iOS SDK`.
+
+- [ ] **Step 2: Написать `Package.swift`**
+
+Имя модуля отличается от имени главного типа `FunnelsGrove`: иначе Swift не разберёт квалифицированные имена вроде `FunnelsGrove.SubscriptionStatus`.
+
+```swift
+// swift-tools-version: 6.0
+import PackageDescription
+
+let package = Package(
+    name: "FunnelsGroveSDK",
+    platforms: [.iOS(.v15), .macOS(.v12)],
+    products: [
+        .library(name: "FunnelsGroveSDK", targets: ["FunnelsGroveSDK"]),
+    ],
+    targets: [
+        .target(name: "FunnelsGroveSDK"),
+        .testTarget(name: "FunnelsGroveSDKTests", dependencies: ["FunnelsGroveSDK"]),
+    ]
+)
+```
+
+- [ ] **Step 3: Написать `.gitignore`**
+
+```gitignore
+.DS_Store
+.build/
+.swiftpm/
+DerivedData/
+xcuserdata/
+
+# Demo app: generated by XcodeGen, plus local signing settings
+Examples/FunnelsGroveDemo/FunnelsGroveDemo.xcodeproj/
+Examples/FunnelsGroveDemo/Support/
+Examples/FunnelsGroveDemo/Config/Local.xcconfig
+```
+
+- [ ] **Step 4: Написать `Sources/FunnelsGroveSDK/FunnelsGroveError.swift`**
+
+```swift
+import Foundation
+
+/// Errors thrown by FunnelsGroveSDK.
+public enum FunnelsGroveError: Error, Equatable, Sendable {
+    /// FunnelsGrove rejected the request with 400 or 401: check `publishableKey`.
+    case configuration(String)
+    /// FunnelsGrove answered with another non-2xx status or a body the SDK cannot read.
+    case server(statusCode: Int)
+    /// The request did not reach FunnelsGrove.
+    case network(URLError)
+    /// `trackLogin()`: FunnelsGrove has no such user in the project of `publishableKey`, for example after a link
+    /// from another project's funnel.
+    case unknownUser
+}
+```
+
+- [ ] **Step 5: Собрать**
+
+```bash
+cd /Users/e/work2/appsilove/funnelsgrove-ios-sdk && mkdir -p Tests/FunnelsGroveSDKTests && touch Tests/FunnelsGroveSDKTests/.gitkeep && swift build
+```
+
+Ожидается: `Build complete!`. Предупреждение `Source files for target FunnelsGroveSDKTests should be located under 'Tests/FunnelsGroveSDKTests'` нормально до задачи 2: в тестовом таргете ещё нет исходников.
+
+Без папки `Tests/FunnelsGroveSDKTests` SwiftPM 6.3 берёт `Sources/` как исходники тестового таргета и падает с `target 'FunnelsGroveSDKTests' has overlapping sources`. Пустую папку git не хранит, поэтому в ней лежит `.gitkeep` до задачи 2.
+
+- [ ] **Step 6: Commit**
+
+```bash
+cd /Users/e/work2/appsilove/funnelsgrove-ios-sdk
+git add Package.swift .gitignore Sources/FunnelsGroveSDK/FunnelsGroveError.swift Tests/FunnelsGroveSDKTests/.gitkeep
+git commit -m "chore: scaffold the FunnelsGroveSDK package" -m "Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
+```
+
+---
+
+### Task 2: Ссылка: `user_id` и `email`
+
+**Files:**
+- Create: `Sources/FunnelsGroveSDK/LinkedUser.swift`
+- Create: `Sources/FunnelsGroveSDK/LinkParser.swift`
+- Test: `Tests/FunnelsGroveSDKTests/LinkParserTests.swift`
+- Delete: `Tests/FunnelsGroveSDKTests/.gitkeep`
+
+Правила из спеки (раздел «handle» и «Email из ссылки»):
+- подходит любая схема и любой хост, в том числе URL без хоста; путь не проверяется;
+- `user_id` — первый параметр с именем ровно `user_id`, после percent-decoding: непустой, до 256 байт в UTF-8, без пробелов и управляющих символов;
+- `email` — первый параметр с именем ровно `email`, после percent-decoding и обрезки пробелов по краям: непустой, до 254 байт, с `@`, без пробелов и управляющих символов; негодный email считается отсутствующим, а `user_id` остаётся;
+- ссылка без годного `user_id` не подходит, даже если в ней есть email.
+
+`URLComponents.queryItems` декодирует `%2B` и `%40`, а литеральный `+` оставляет `+`: это и нужно для email.
+
+- [ ] **Step 1: Написать падающий тест**
+
+`Tests/FunnelsGroveSDKTests/LinkParserTests.swift`:
+
+```swift
+import XCTest
+@testable import FunnelsGroveSDK
+
+final class LinkParserTests: XCTestCase {
+    private func user(_ link: String) -> LinkedUser? {
+        LinkParser.user(from: URL(string: link)!)
+    }
+
+    func testReadsTheUserAndEmailFromAFunnelsGroveLink() {
+        XCTAssertEqual(
+            user("https://go.example.com/open?user_id=u_123&email=buyer%40example.com&utm_source=fg"),
+            LinkedUser(userId: "u_123", email: "buyer@example.com")
+        )
+    }
+
+    func testAcceptsAnyHostAndScheme() {
+        for link in [
+            "https://any.example.org/some/path?user_id=u_1",
+            "https://GO.Example.com/open?user_id=u_1",
+            "http://example.com/?user_id=u_1",
+            "fgdemo://open?user_id=u_1",
+            "fgdemo:?user_id=u_1",
+        ] {
+            XCTAssertEqual(user(link), LinkedUser(userId: "u_1"), link)
+        }
+    }
+
+    func testTakesTheFirstUserId() {
+        XCTAssertEqual(user("fgdemo://open?user_id=u_1&user_id=u_2")?.userId, "u_1")
+    }
+
+    func testRejectsMissingOrMalformedUserIds() {
+        XCTAssertNil(user("https://go.example.com/open"))
+        XCTAssertNil(user("https://go.example.com/open?user_id"))
+        XCTAssertNil(user("https://go.example.com/open?user_id="))
+        XCTAssertNil(user("https://go.example.com/open?User_Id=u_1"))
+        XCTAssertNil(user("https://go.example.com/open?user_id=u%201"))
+        XCTAssertNil(user("https://go.example.com/open?user_id=u_1%0A"))
+        XCTAssertNil(user("https://go.example.com/open?user_id=" + String(repeating: "a", count: 257)))
+        // One grapheme, 601 UTF-8 bytes: "a" followed by 300 combining acute accents.
+        XCTAssertNil(user("https://go.example.com/open?user_id=a" + String(repeating: "%CC%81", count: 300)))
+    }
+
+    func testRejectsAnEmailWithoutAUserId() {
+        XCTAssertNil(user("fgdemo://open?email=buyer%40example.com"))
+    }
+
+    func testAcceptsTheLongestAllowedUserId() {
+        let longest = String(repeating: "a", count: 256)
+        XCTAssertEqual(user("https://go.example.com/open?user_id=" + longest)?.userId, longest)
+    }
+
+    func testDecodesAndTrimsTheEmail() {
+        XCTAssertEqual(user("fgdemo://open?user_id=u_1&email=a%2Bb%40example.com")?.email, "a+b@example.com")
+        // A literal + stays a +: FunnelsGrove encodes it, a hand-made link may not.
+        XCTAssertEqual(user("fgdemo://open?user_id=u_1&email=a+b@example.com")?.email, "a+b@example.com")
+        XCTAssertEqual(user("fgdemo://open?user_id=u_1&email=%20buyer%40example.com%20")?.email, "buyer@example.com")
+    }
+
+    func testDropsAnEmailThatCannotBeOneButKeepsTheUser() {
+        for email in [
+            "",
+            "%20",
+            "buyer.example.com",
+            "a%20b%40example.com",
+            "a%0A%40example.com",
+            String(repeating: "a", count: 250) + "%40b.co",
+        ] {
+            XCTAssertEqual(user("fgdemo://open?user_id=u_1&email=" + email), LinkedUser(userId: "u_1"), email)
+        }
+    }
+
+    func testAcceptsTheLongestAllowedEmail() {
+        let longest = String(repeating: "a", count: 249) + "@b.co"
+        XCTAssertEqual(longest.utf8.count, 254)
+        XCTAssertEqual(user("fgdemo://open?user_id=u_1&email=" + longest)?.email, longest)
+    }
+}
+```
+
+- [ ] **Step 2: Убедиться, что тест падает**
+
+```bash
+cd /Users/e/work2/appsilove/funnelsgrove-ios-sdk && rm Tests/FunnelsGroveSDKTests/.gitkeep && swift test
+```
+
+Ожидается: компиляция падает с `error: cannot find 'LinkedUser' in scope`.
+
+- [ ] **Step 3: Написать `Sources/FunnelsGroveSDK/LinkedUser.swift`**
+
+`LinkedUser` — и результат разбора ссылки, и значение записи в Keychain. `encode(to:)` пишет `"email": null` явно, как в спеке; чтение принимает и запись без ключа `email`.
+
+```swift
+import Foundation
+
+/// The buyer a FunnelsGrove link points at: the user ID and, when the link carries one, the email they bought with.
+struct LinkedUser: Codable, Equatable, Sendable {
+    let userId: String
+    /// Not verified: the address the buyer typed in the funnel, known to anyone who has the link.
+    let email: String?
+
+    init(userId: String, email: String? = nil) {
+        self.userId = userId
+        self.email = email
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case userId
+        case email
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(userId, forKey: .userId)
+        // An explicit null rather than a missing key.
+        try container.encode(email, forKey: .email)
+    }
+}
+```
+
+- [ ] **Step 4: Написать `Sources/FunnelsGroveSDK/LinkParser.swift`**
+
+```swift
+import Foundation
+
+enum LinkParser {
+    static let maxUserIdLength = 256
+    static let maxEmailLength = 254
+
+    /// Returns the buyer a FunnelsGrove link carries, or `nil` when the URL has no valid `user_id`.
+    /// Any scheme and host pass: the app's entitlements, its AASA file and its URL types decide which links open it.
+    static func user(from url: URL) -> LinkedUser? {
+        guard
+            let items = URLComponents(url: url, resolvingAgainstBaseURL: false)?.queryItems,
+            let userId = items.first(where: { $0.name == "user_id" })?.value,
+            isValidUserId(userId)
+        else {
+            return nil
+        }
+        return LinkedUser(userId: userId, email: validEmail(items.first(where: { $0.name == "email" })?.value))
+    }
+
+    /// Non-empty, at most 256 UTF-8 bytes, no whitespace or control characters. The byte limit keeps a letter
+    /// with a thousand combining marks from passing as one character.
+    static func isValidUserId(_ value: String) -> Bool {
+        !value.isEmpty && value.utf8.count <= maxUserIdLength && !value.unicodeScalars.contains(where: isForbidden)
+    }
+
+    /// The trimmed address if it can be one: at most 254 UTF-8 bytes, an `@`, no whitespace or control characters
+    /// inside. This keeps junk out of the app; it does not prove that the address works or belongs to the user.
+    static func validEmail(_ value: String?) -> String? {
+        guard
+            let email = value?.trimmingCharacters(in: .whitespacesAndNewlines),
+            !email.isEmpty,
+            email.utf8.count <= maxEmailLength,
+            email.contains("@"),
+            !email.unicodeScalars.contains(where: isForbidden)
+        else {
+            return nil
+        }
+        return email
+    }
+
+    private static func isForbidden(_ scalar: Unicode.Scalar) -> Bool {
+        CharacterSet.whitespacesAndNewlines.contains(scalar) || CharacterSet.controlCharacters.contains(scalar)
+    }
+}
+```
+
+- [ ] **Step 5: Убедиться, что тесты проходят**
+
+```bash
+cd /Users/e/work2/appsilove/funnelsgrove-ios-sdk && swift test
+```
+
+Ожидается: `Executed 9 tests, with 0 failures`.
+
+- [ ] **Step 6: Commit**
+
+```bash
+cd /Users/e/work2/appsilove/funnelsgrove-ios-sdk
+git add Sources/FunnelsGroveSDK/LinkedUser.swift Sources/FunnelsGroveSDK/LinkParser.swift Tests/FunnelsGroveSDKTests/LinkParserTests.swift Tests/FunnelsGroveSDKTests/.gitkeep
+git commit -m "feat: read the FunnelsGrove user and email from a link of any scheme and host" -m "Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
+```
+
+`git add` для удалённого `.gitkeep` записывает его удаление.
+
+---
+
+### Task 3: Клиент FunnelsGrove
+
+**Files:**
+- Create: `Tests/FunnelsGroveSDKTests/StubURLProtocol.swift`
+- Create: `Tests/FunnelsGroveSDKTests/SleepRecorder.swift`
+- Create: `Tests/FunnelsGroveSDKTests/Assertions.swift`
+- Test: `Tests/FunnelsGroveSDKTests/FunnelsGroveClientTests.swift`
+- Create: `Sources/FunnelsGroveSDK/FunnelsGroveClient.swift`
+
+Контракт FG (спека, «Что уже есть в FG»):
+- оба запроса — `POST` с `Content-Type: application/json`, `X-SDK-Publishable-Key` и телом `{"userId": "<id>"}`, таймаут 10 секунд, без редиректов на уровне кода (их выполняет `URLSession`, как в AppsiloveSDK);
+- на 503 с `Retry-After` от 0 до 10 секунд — одно ожидание и повтор; HTTP-дата, отрицательное и большее значение дают `.server(503)`;
+- 400 и 401 — `.configuration`, остальные не-2xx — `.server`, `URLError` — `.network`, отмена — `CancellationError`;
+- `verify_subscription`: тело 2xx, которое не разбирается, — `.server` с этим кодом;
+- `track_login`: 404 — `.unknownUser`, тело ответа не разбирается. В отличие от AppsiloveSDK, 503 повторяется: FG не дублирует событие входа.
+
+- [ ] **Step 1: Написать тестовые помощники**
+
+`Tests/FunnelsGroveSDKTests/StubURLProtocol.swift` (тот же, что в AppsiloveSDK):
+
+```swift
+import Foundation
+
+/// Answers URLSession requests from a queue of canned responses and records the requests.
+final class StubURLProtocol: URLProtocol {
+    typealias Handler = @Sendable (URLRequest) throws -> (HTTPURLResponse, Data)
+
+    // URLSession calls startLoading on its own thread while tests read `requests`.
+    private static let lock = NSLock()
+    nonisolated(unsafe) private static var queuedHandlers: [Handler] = []
+    nonisolated(unsafe) private static var recordedRequests: [URLRequest] = []
+
+    static var requests: [URLRequest] {
+        lock.withLock { recordedRequests }
+    }
+
+    static func reset() {
+        lock.withLock {
+            queuedHandlers = []
+            recordedRequests = []
+        }
+    }
+
+    private static func enqueue(_ handler: @escaping Handler) {
+        lock.withLock { queuedHandlers.append(handler) }
+    }
+
+    private static func record(_ request: URLRequest) -> Handler? {
+        lock.withLock {
+            recordedRequests.append(request)
+            return queuedHandlers.isEmpty ? nil : queuedHandlers.removeFirst()
+        }
+    }
+
+    static func session() -> URLSession {
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [StubURLProtocol.self]
+        return URLSession(configuration: configuration)
+    }
+
+    static func respond(_ statusCode: Int, json: String, headers: [String: String] = [:]) {
+        enqueue { request in
+            let response = HTTPURLResponse(
+                url: request.url!,
+                statusCode: statusCode,
+                httpVersion: "HTTP/1.1",
+                headerFields: headers.merging(["Content-Type": "application/json"]) { current, _ in current }
+            )!
+            return (response, Data(json.utf8))
+        }
+    }
+
+    static func fail(_ code: URLError.Code) {
+        enqueue { _ in throw URLError(code) }
+    }
+
+    /// Leaves the next request unanswered until its task is cancelled.
+    static func hang() {
+        enqueue { _ in throw Hang() }
+    }
+
+    private struct Hang: Error {}
+
+    override class func canInit(with request: URLRequest) -> Bool { true }
+
+    override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
+
+    override func startLoading() {
+        guard let handler = Self.record(request) else {
+            client?.urlProtocol(self, didFailWithError: URLError(.resourceUnavailable))
+            return
+        }
+        do {
+            let (response, data) = try handler(request)
+            client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
+            client?.urlProtocol(self, didLoad: data)
+            client?.urlProtocolDidFinishLoading(self)
+        } catch is Hang {
+            return
+        } catch {
+            client?.urlProtocol(self, didFailWithError: error)
+        }
+    }
+
+    override func stopLoading() {}
+}
+
+extension URLRequest {
+    /// URLSession hands the body to URL protocols as a stream.
+    func jsonBody() -> [String: String]? {
+        guard let stream = httpBodyStream else { return nil }
+        stream.open()
+        defer { stream.close() }
+        var data = Data()
+        var buffer = [UInt8](repeating: 0, count: 1024)
+        while stream.hasBytesAvailable {
+            let count = stream.read(&buffer, maxLength: buffer.count)
+            guard count > 0 else { break }
+            data.append(buffer, count: count)
+        }
+        return try? JSONSerialization.jsonObject(with: data) as? [String: String]
+    }
+}
+```
+
+`Tests/FunnelsGroveSDKTests/SleepRecorder.swift`:
+
+```swift
+import Foundation
+
+/// Stands in for `Task.sleep` and remembers the requested delays.
+actor SleepRecorder {
+    private(set) var delays: [TimeInterval] = []
+
+    func record(_ delay: TimeInterval) {
+        delays.append(delay)
+    }
+}
+```
+
+`Tests/FunnelsGroveSDKTests/Assertions.swift`. Помощник не изолирован от актора, поэтому в `@MainActor`-тестах фасада (задача 5) вместо него стоит `do/catch`: Swift 6 не даёт передать туда замыкание с `sdk`.
+
+```swift
+import XCTest
+@testable import FunnelsGroveSDK
+
+/// Fails unless `body` throws exactly `expected`.
+func assertThrows(
+    _ expected: FunnelsGroveError,
+    message: String = "",
+    file: StaticString = #filePath,
+    line: UInt = #line,
+    _ body: () async throws -> Void
+) async {
+    do {
+        try await body()
+        XCTFail("Expected \(expected) \(message)", file: file, line: line)
+    } catch let error as FunnelsGroveError {
+        XCTAssertEqual(error, expected, message, file: file, line: line)
+    } catch {
+        XCTFail("Unexpected error \(error) \(message)", file: file, line: line)
+    }
+}
+```
+
+- [ ] **Step 2: Написать падающий тест**
+
+`Tests/FunnelsGroveSDKTests/FunnelsGroveClientTests.swift`:
+
+```swift
+import XCTest
+@testable import FunnelsGroveSDK
+
+final class FunnelsGroveClientTests: XCTestCase {
+    private var sleeps = SleepRecorder()
+    private var client: FunnelsGroveClient!
+
+    override func setUp() {
+        super.setUp()
+        StubURLProtocol.reset()
+        sleeps = SleepRecorder()
+        let sleeps = sleeps
+        client = FunnelsGroveClient(
+            baseURL: URL(string: "https://sdk-api.example.com")!,
+            publishableKey: "pk_test",
+            session: StubURLProtocol.session(),
+            sleep: { await sleeps.record($0) }
+        )
+    }
+
+    func testVerifySendsThePublishableKeyAndUserId() async throws {
+        StubURLProtocol.respond(200, json: #"{"active":true,"test":false,"user":{"user_id":"u_1"}}"#)
+
+        let response = try await client.verifySubscription(userId: "u_1")
+
+        XCTAssertEqual(response, VerifySubscriptionResponse(active: true, test: false, user: .init(userId: "u_1")))
+        let request = try XCTUnwrap(StubURLProtocol.requests.first)
+        XCTAssertEqual(request.url?.absoluteString, "https://sdk-api.example.com/sdk/public/users/verify_subscription")
+        XCTAssertEqual(request.httpMethod, "POST")
+        XCTAssertEqual(request.value(forHTTPHeaderField: "Content-Type"), "application/json")
+        XCTAssertEqual(request.value(forHTTPHeaderField: "X-SDK-Publishable-Key"), "pk_test")
+        XCTAssertEqual(request.jsonBody(), ["userId": "u_1"])
+    }
+
+    func testVerifyReadsAnUnknownUser() async throws {
+        StubURLProtocol.respond(200, json: #"{"active":false,"test":false,"user":null}"#)
+
+        let response = try await client.verifySubscription(userId: "u_1")
+
+        XCTAssertEqual(response, VerifySubscriptionResponse(active: false, test: false, user: nil))
+    }
+
+    func testVerifyMaps400And401ToConfiguration() async {
+        for status in [400, 401] {
+            StubURLProtocol.respond(status, json: #"{"error":"invalid key"}"#)
+
+            await assertThrows(.configuration("FunnelsGrove answered \(status): check publishableKey")) {
+                _ = try await self.client.verifySubscription(userId: "u_1")
+            }
+        }
+    }
+
+    func testVerifyMapsOtherStatusesToServer() async {
+        for status in [404, 500] {
+            StubURLProtocol.respond(status, json: "{}")
+
+            await assertThrows(.server(statusCode: status)) {
+                _ = try await self.client.verifySubscription(userId: "u_1")
+            }
+        }
+    }
+
+    func testVerifyMapsAnUnreadableBodyToServer() async {
+        StubURLProtocol.respond(200, json: "not json")
+
+        await assertThrows(.server(statusCode: 200)) {
+            _ = try await self.client.verifySubscription(userId: "u_1")
+        }
+    }
+
+    func testVerifyRetriesOnceAfterAShort503() async throws {
+        StubURLProtocol.respond(503, json: "{}", headers: ["Retry-After": "2"])
+        StubURLProtocol.respond(200, json: #"{"active":true,"test":false,"user":{"user_id":"u_1"}}"#)
+
+        let response = try await client.verifySubscription(userId: "u_1")
+
+        XCTAssertTrue(response.active)
+        XCTAssertEqual(StubURLProtocol.requests.count, 2)
+        let delays = await sleeps.delays
+        XCTAssertEqual(delays, [2])
+    }
+
+    func testVerifyReportsA503ThatAsksToWaitTooLongOrNamesNoUsableWait() async {
+        for retryAfter in ["30", "-1", "Wed, 21 Oct 2026 07:28:00 GMT"] {
+            StubURLProtocol.reset()
+            StubURLProtocol.respond(503, json: "{}", headers: ["Retry-After": retryAfter])
+
+            await assertThrows(.server(statusCode: 503), message: retryAfter) {
+                _ = try await self.client.verifySubscription(userId: "u_1")
+            }
+            XCTAssertEqual(StubURLProtocol.requests.count, 1, retryAfter)
+        }
+        let delays = await sleeps.delays
+        XCTAssertEqual(delays, [])
+    }
+
+    func testVerifyReportsASecond503() async {
+        StubURLProtocol.respond(503, json: "{}", headers: ["Retry-After": "1"])
+        StubURLProtocol.respond(503, json: "{}", headers: ["Retry-After": "1"])
+
+        await assertThrows(.server(statusCode: 503)) {
+            _ = try await self.client.verifySubscription(userId: "u_1")
+        }
+        XCTAssertEqual(StubURLProtocol.requests.count, 2)
+    }
+
+    func testVerifyMapsTransportFailuresToNetwork() async {
+        StubURLProtocol.fail(.notConnectedToInternet)
+
+        do {
+            _ = try await client.verifySubscription(userId: "u_1")
+            XCTFail("Expected a network error")
+        } catch FunnelsGroveError.network(let error) {
+            XCTAssertEqual(error.code, .notConnectedToInternet)
+        } catch {
+            XCTFail("Unexpected error \(error)")
+        }
+    }
+
+    func testVerifyReportsCancellationAsCancellation() async throws {
+        StubURLProtocol.hang()
+        let client = try XCTUnwrap(client)
+        let task = Task { try await client.verifySubscription(userId: "u_1") }
+        for _ in 0..<500 where StubURLProtocol.requests.isEmpty {
+            try await Task.sleep(nanoseconds: 2_000_000)
+        }
+
+        task.cancel()
+
+        do {
+            _ = try await task.value
+            XCTFail("Expected cancellation")
+        } catch is CancellationError {
+        } catch {
+            XCTFail("Unexpected error \(error)")
+        }
+    }
+
+    func testTrackLoginPostsTheUserId() async throws {
+        StubURLProtocol.respond(200, json: #"{"user":{"user_id":"u_1"},"login":{"tracked":true,"newlyTracked":true}}"#)
+
+        try await client.trackLogin(userId: "u_1")
+
+        let request = try XCTUnwrap(StubURLProtocol.requests.first)
+        XCTAssertEqual(request.url?.absoluteString, "https://sdk-api.example.com/sdk/public/users/track_login")
+        XCTAssertEqual(request.httpMethod, "POST")
+        XCTAssertEqual(request.value(forHTTPHeaderField: "Content-Type"), "application/json")
+        XCTAssertEqual(request.value(forHTTPHeaderField: "X-SDK-Publishable-Key"), "pk_test")
+        XCTAssertEqual(request.jsonBody(), ["userId": "u_1"])
+    }
+
+    func testTrackLoginIgnoresTheResponseBody() async throws {
+        StubURLProtocol.respond(200, json: "not json")
+
+        try await client.trackLogin(userId: "u_1")
+    }
+
+    func testTrackLoginRetriesOnceAfterAShort503() async throws {
+        StubURLProtocol.respond(503, json: "{}", headers: ["Retry-After": "1"])
+        StubURLProtocol.respond(200, json: "{}")
+
+        try await client.trackLogin(userId: "u_1")
+
+        XCTAssertEqual(StubURLProtocol.requests.count, 2)
+        let delays = await sleeps.delays
+        XCTAssertEqual(delays, [1])
+    }
+
+    func testTrackLoginMaps404ToUnknownUser() async {
+        StubURLProtocol.respond(404, json: #"{"error":"Funnel user not found"}"#)
+
+        await assertThrows(.unknownUser) {
+            try await self.client.trackLogin(userId: "u_1")
+        }
+    }
+
+    func testTrackLoginMapsOtherErrors() async {
+        StubURLProtocol.respond(400, json: #"{"error":"funnelId is required"}"#)
+        await assertThrows(.configuration("FunnelsGrove answered 400: check publishableKey")) {
+            try await self.client.trackLogin(userId: "u_1")
+        }
+
+        StubURLProtocol.respond(500, json: "{}")
+        await assertThrows(.server(statusCode: 500)) {
+            try await self.client.trackLogin(userId: "u_1")
+        }
+    }
+}
+```
+
+- [ ] **Step 3: Убедиться, что тест падает**
+
+```bash
+cd /Users/e/work2/appsilove/funnelsgrove-ios-sdk && swift test
+```
+
+Ожидается: компиляция падает с `error: cannot find 'VerifySubscriptionResponse' in scope` (и с той же ошибкой для `FunnelsGroveClient`).
+
+- [ ] **Step 4: Написать `Sources/FunnelsGroveSDK/FunnelsGroveClient.swift`**
+
+Отправка запроса и маппинг `URLError` живут прямо в клиенте: в AppsiloveSDK они были в `HTTP.swift`, потому что их делили два клиента, а здесь клиент один.
+
+```swift
+import Foundation
+
+typealias Sleep = @Sendable (TimeInterval) async throws -> Void
+
+func sleepSeconds(_ seconds: TimeInterval) async throws {
+    // UInt64 traps on negative or non-finite values.
+    guard seconds.isFinite, seconds > 0 else { return }
+    try await Task.sleep(nanoseconds: UInt64(seconds * 1_000_000_000))
+}
+
+struct VerifySubscriptionResponse: Decodable, Equatable, Sendable {
+    struct User: Decodable, Equatable, Sendable {
+        let userId: String
+
+        enum CodingKeys: String, CodingKey {
+            case userId = "user_id"
+        }
+    }
+
+    let active: Bool
+    let test: Bool
+    let user: User?
+}
+
+protocol FunnelsGroveAPI: Sendable {
+    func verifySubscription(userId: String) async throws -> VerifySubscriptionResponse
+    func trackLogin(userId: String) async throws
+}
+
+/// Calls the FunnelsGrove public SDK API with the project's publishable key.
+struct FunnelsGroveClient: FunnelsGroveAPI {
+    /// A 503 asking to wait longer than this is reported instead of retried.
+    static let maxRetryAfter: TimeInterval = 10
+
+    let baseURL: URL
+    let publishableKey: String
+    var session: URLSession = .shared
+    var sleep: Sleep = sleepSeconds
+
+    func verifySubscription(userId: String) async throws -> VerifySubscriptionResponse {
+        let (data, response) = try await send("sdk/public/users/verify_subscription", userId: userId)
+        try check(response)
+        do {
+            return try JSONDecoder().decode(VerifySubscriptionResponse.self, from: data)
+        } catch {
+            throw FunnelsGroveError.server(statusCode: response.statusCode)
+        }
+    }
+
+    /// FunnelsGrove records one login per user, funnel and environment, so a repeated or retried call adds nothing.
+    func trackLogin(userId: String) async throws {
+        let (_, response) = try await send("sdk/public/users/track_login", userId: userId)
+        if response.statusCode == 404 { throw FunnelsGroveError.unknownUser }
+        try check(response)
+    }
+
+    /// Posts `{"userId": …}`, and once more after a 503 that asks for a short wait.
+    private func send(_ path: String, userId: String) async throws -> (Data, HTTPURLResponse) {
+        var (data, response) = try await post(path, userId: userId)
+        if response.statusCode == 503, let delay = retryAfter(response), (0...Self.maxRetryAfter).contains(delay) {
+            try await sleep(delay)
+            (data, response) = try await post(path, userId: userId)
+        }
+        return (data, response)
+    }
+
+    private func post(_ path: String, userId: String) async throws -> (Data, HTTPURLResponse) {
+        var request = URLRequest(url: baseURL.appendingPathComponent(path), timeoutInterval: 10)
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.setValue(publishableKey, forHTTPHeaderField: "X-SDK-Publishable-Key")
+        request.httpBody = try JSONEncoder().encode(["userId": userId])
+        do {
+            let (data, response) = try await session.data(for: request)
+            guard let httpResponse = response as? HTTPURLResponse else {
+                throw FunnelsGroveError.server(statusCode: 0)
+            }
+            return (data, httpResponse)
+        } catch let error as URLError {
+            // A SwiftUI `.task` whose view went away is not a network failure.
+            if error.code == .cancelled || Task.isCancelled { throw CancellationError() }
+            throw FunnelsGroveError.network(error)
+        }
+    }
+
+    /// Seconds from `Retry-After`; an HTTP date is ignored.
+    private func retryAfter(_ response: HTTPURLResponse) -> TimeInterval? {
+        response.value(forHTTPHeaderField: "Retry-After").flatMap(TimeInterval.init)
+    }
+
+    private func check(_ response: HTTPURLResponse) throws {
+        switch response.statusCode {
+        case 200..<300:
+            return
+        case 400, 401:
+            throw FunnelsGroveError.configuration("FunnelsGrove answered \(response.statusCode): check publishableKey")
+        default:
+            throw FunnelsGroveError.server(statusCode: response.statusCode)
+        }
+    }
+}
+```
+
+- [ ] **Step 5: Убедиться, что тесты проходят**
+
+```bash
+cd /Users/e/work2/appsilove/funnelsgrove-ios-sdk && swift test
+```
+
+Ожидается: `Executed 24 tests, with 0 failures`.
+
+- [ ] **Step 6: Commit**
+
+```bash
+cd /Users/e/work2/appsilove/funnelsgrove-ios-sdk
+git add Sources/FunnelsGroveSDK/FunnelsGroveClient.swift Tests/FunnelsGroveSDKTests/StubURLProtocol.swift Tests/FunnelsGroveSDKTests/SleepRecorder.swift Tests/FunnelsGroveSDKTests/Assertions.swift Tests/FunnelsGroveSDKTests/FunnelsGroveClientTests.swift
+git commit -m "feat: call FunnelsGrove verify_subscription and track_login" -m "Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
+```
+
+---
+
+### Task 4: Хранение в Keychain
+
+**Files:**
+- Create: `Sources/FunnelsGroveSDK/UserStore.swift`
+- Test: `Tests/FunnelsGroveSDKTests/UserStoreTests.swift`
+
+Одна запись generic password: `kSecAttrService = "com.funnelsgrove.sdk"`, `kSecAttrAccount = "user"`, значение — JSON `LinkedUser`. Доступность `AfterFirstUnlock`, синхронизация через iCloud Keychain, чтение и удаление с `kSecAttrSynchronizableAny`. Неизменённая запись не перезаписывается. Запись, которую не удалось разобрать, считается отсутствующей. Тесты проверяют формат записи; сами вызовы Keychain — в задаче 7.
+
+- [ ] **Step 1: Написать падающий тест**
+
+`Tests/FunnelsGroveSDKTests/UserStoreTests.swift`:
+
+```swift
+import XCTest
+@testable import FunnelsGroveSDK
+
+/// The keychain calls themselves need a signed app: see the demo app. These tests cover the stored data.
+final class UserStoreTests: XCTestCase {
+    func testStoresTheIdAndEmailAsJSON() throws {
+        let data = try KeychainUserStore.encode(LinkedUser(userId: "u_1", email: "buyer@example.com"))
+
+        let object = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: String])
+        XCTAssertEqual(object, ["userId": "u_1", "email": "buyer@example.com"])
+    }
+
+    func testStoresAMissingEmailAsNull() throws {
+        let data = try KeychainUserStore.encode(LinkedUser(userId: "u_1"))
+
+        let object = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
+        XCTAssertEqual(object["userId"] as? String, "u_1")
+        XCTAssertTrue(object["email"] is NSNull)
+    }
+
+    func testReadsBackWhatItStores() throws {
+        for user in [LinkedUser(userId: "u_1", email: "buyer@example.com"), LinkedUser(userId: "u_1")] {
+            XCTAssertEqual(KeychainUserStore.decode(try KeychainUserStore.encode(user)), user)
+        }
+    }
+
+    func testReadsAnItemWithoutTheEmailKey() {
+        XCTAssertEqual(KeychainUserStore.decode(Data(#"{"userId":"u_1"}"#.utf8)), LinkedUser(userId: "u_1"))
+    }
+
+    func testTreatsDamagedDataAsNoUser() {
+        for json in ["not json", "{}", #"{"userId":""}"#, #"{"userId":"u 1"}"#, #"{"userId":1}"#, #""u_1""#] {
+            XCTAssertNil(KeychainUserStore.decode(Data(json.utf8)), json)
+        }
+    }
+}
+```
+
+- [ ] **Step 2: Убедиться, что тест падает**
+
+```bash
+cd /Users/e/work2/appsilove/funnelsgrove-ios-sdk && swift test
+```
+
+Ожидается: компиляция падает с `error: cannot find 'KeychainUserStore' in scope`.
+
+- [ ] **Step 3: Написать `Sources/FunnelsGroveSDK/UserStore.swift`**
+
+```swift
+import Foundation
+import os
+import Security
+
+private let keychainLogger = Logger(subsystem: "com.funnelsgrove.sdk", category: "Keychain")
+
+protocol UserStore {
+    func read() -> LinkedUser?
+    func save(_ user: LinkedUser) throws
+    func delete()
+}
+
+struct KeychainError: Error, Equatable, CustomStringConvertible {
+    let status: OSStatus
+
+    var description: String {
+        let message = SecCopyErrorMessageString(status, nil) as String? ?? "unknown error"
+        return "Keychain error \(status): \(message)"
+    }
+}
+
+/// Keeps the linked user's ID and email in one keychain item, so they always change together, and lets iCloud
+/// Keychain sync it. Keychain items outlive app deletion in practice; Apple does not guarantee it.
+struct KeychainUserStore: UserStore {
+    var service = "com.funnelsgrove.sdk"
+    var account = "user"
+
+    func read() -> LinkedUser? {
+        var query = baseQuery()
+        // Without SynchronizableAny the query skips iCloud-synced items.
+        query[kSecAttrSynchronizable as String] = kSecAttrSynchronizableAny
+        query[kSecReturnData as String] = true
+        query[kSecMatchLimit as String] = kSecMatchLimitOne
+        var result: CFTypeRef?
+        let status = SecItemCopyMatching(query as CFDictionary, &result)
+        guard status == errSecSuccess, let data = result as? Data else {
+            log(status, action: "Reading the user")
+            return nil
+        }
+        guard let user = Self.decode(data) else {
+            keychainLogger.error("The stored user is unreadable: treating it as no user")
+            return nil
+        }
+        return user
+    }
+
+    func save(_ user: LinkedUser) throws {
+        // Rewriting an unchanged user would only churn iCloud Keychain sync.
+        if read() == user { return }
+        // Delete first so the add never hits errSecDuplicateItem, whatever the old item's sync state.
+        delete()
+        var attributes = baseQuery()
+        attributes[kSecAttrSynchronizable as String] = true
+        attributes[kSecAttrAccessible as String] = kSecAttrAccessibleAfterFirstUnlock
+        attributes[kSecValueData as String] = try Self.encode(user)
+        let status = SecItemAdd(attributes as CFDictionary, nil)
+        guard status == errSecSuccess else { throw KeychainError(status: status) }
+    }
+
+    func delete() {
+        var query = baseQuery()
+        query[kSecAttrSynchronizable as String] = kSecAttrSynchronizableAny
+        log(SecItemDelete(query as CFDictionary), action: "Deleting the user")
+    }
+
+    static func encode(_ user: LinkedUser) throws -> Data {
+        try JSONEncoder().encode(user)
+    }
+
+    /// The stored user, or `nil` for data that is not one: a damaged item must not turn into a user ID.
+    static func decode(_ data: Data) -> LinkedUser? {
+        guard let user = try? JSONDecoder().decode(LinkedUser.self, from: data),
+              LinkParser.isValidUserId(user.userId)
+        else {
+            return nil
+        }
+        return user
+    }
+
+    private func baseQuery() -> [String: Any] {
+        [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: service,
+            kSecAttrAccount as String: account,
+        ]
+    }
+
+    private func log(_ status: OSStatus, action: String) {
+        guard status != errSecSuccess, status != errSecItemNotFound else { return }
+        keychainLogger.error("\(action, privacy: .public) failed: \(KeychainError(status: status).description, privacy: .public)")
+    }
+}
+```
+
+- [ ] **Step 4: Убедиться, что тесты проходят**
+
+```bash
+cd /Users/e/work2/appsilove/funnelsgrove-ios-sdk && swift test
+```
+
+Ожидается: `Executed 29 tests, with 0 failures`.
+
+- [ ] **Step 5: Commit**
+
+```bash
+cd /Users/e/work2/appsilove/funnelsgrove-ios-sdk
+git add Sources/FunnelsGroveSDK/UserStore.swift Tests/FunnelsGroveSDKTests/UserStoreTests.swift
+git commit -m "feat: keep the user ID and email in one keychain item with iCloud sync" -m "Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
+```
+
+---
+
+### Task 5: Фасад `FunnelsGrove`
+
+**Files:**
+- Create: `Sources/FunnelsGroveSDK/SubscriptionStatus.swift`
+- Create: `Sources/FunnelsGroveSDK/FunnelsGrove.swift`
+- Create: `Tests/FunnelsGroveSDKTests/Fakes.swift`
+- Test: `Tests/FunnelsGroveSDKTests/FunnelsGroveTests.swift`
+
+Поведение из спеки:
+- `configure` останавливает приложение, если ключ пустой, с пробельными символами или начинается с `sdk_sec_` или `fg_key_`. Проверка вынесена в `publishableKeyProblem(_:)`, чтобы тестировать её без `precondition`.
+- `handle` сохраняет `LinkedUser`. Ссылка без годного email оставляет email того же `user_id` и стирает email другого. `handle` запоминает время ссылки и `track_login` не вызывает.
+- `checkSubscription` — как в AppsiloveSDK без `manageSubscriptionURL`: опрос 1, 2, 4, 8 секунд в течение 120 секунд после ссылки, ответ для текущего пользователя.
+- `trackLogin` без пользователя возвращает `false` без сети, иначе отправляет текущий `user_id` и возвращает `true`.
+- `reset` удаляет запись и время ссылки.
+
+- [ ] **Step 1: Написать тестовые дублёры**
+
+`Tests/FunnelsGroveSDKTests/Fakes.swift`:
+
+```swift
+import Foundation
+@testable import FunnelsGroveSDK
+
+final class FakeUserStore: UserStore {
+    var value: LinkedUser?
+    var saveError: Error?
+
+    func read() -> LinkedUser? { value }
+
+    func save(_ user: LinkedUser) throws {
+        if let saveError { throw saveError }
+        value = user
+    }
+
+    func delete() { value = nil }
+}
+
+actor FakeFunnelsGrove: FunnelsGroveAPI {
+    private var answers: [VerifySubscriptionResponse]
+    private var verifyError: FunnelsGroveError?
+    private var trackError: FunnelsGroveError?
+    private var duringNextVerify: (@Sendable () async -> Void)?
+    private(set) var verifiedUserIds: [String] = []
+    private(set) var trackedUserIds: [String] = []
+
+    init(answers: [VerifySubscriptionResponse] = []) {
+        self.answers = answers
+    }
+
+    func failVerification(with error: FunnelsGroveError) {
+        verifyError = error
+    }
+
+    func failTracking(with error: FunnelsGroveError) {
+        trackError = error
+    }
+
+    /// Runs `action` while the next verify request is in flight.
+    func duringNextVerify(_ action: @escaping @Sendable () async -> Void) {
+        duringNextVerify = action
+    }
+
+    func verifySubscription(userId: String) async throws -> VerifySubscriptionResponse {
+        verifiedUserIds.append(userId)
+        if let action = duringNextVerify {
+            duringNextVerify = nil
+            await action()
+        }
+        if let verifyError { throw verifyError }
+        return answers.count > 1 ? answers.removeFirst() : answers[0]
+    }
+
+    func trackLogin(userId: String) async throws {
+        trackedUserIds.append(userId)
+        if let trackError { throw trackError }
+    }
+}
+
+final class TestClock {
+    var now = Date(timeIntervalSince1970: 1_000_000)
+}
+```
+
+- [ ] **Step 2: Написать падающий тест**
+
+`Tests/FunnelsGroveSDKTests/FunnelsGroveTests.swift`:
+
+```swift
+import XCTest
+@testable import FunnelsGroveSDK
+
+@MainActor
+final class FunnelsGroveTests: XCTestCase {
+    private let link = URL(string: "https://go.example.com/open?user_id=u_1&email=buyer%40example.com")!
+    private let active = VerifySubscriptionResponse(active: true, test: false, user: .init(userId: "u_1"))
+    private let inactive = VerifySubscriptionResponse(active: false, test: false, user: .init(userId: "u_1"))
+    private let activeTest = VerifySubscriptionResponse(active: true, test: true, user: .init(userId: "u_1"))
+    private let unknown = VerifySubscriptionResponse(active: false, test: false, user: nil)
+
+    private var store = FakeUserStore()
+    private var clock = TestClock()
+    private var sleeps = SleepRecorder()
+
+    override func setUp() async throws {
+        store = FakeUserStore()
+        clock = TestClock()
+        sleeps = SleepRecorder()
+    }
+
+    private func makeSDK(
+        answers: [VerifySubscriptionResponse],
+        acceptTestSubscriptions: Bool = false
+    ) -> (FunnelsGrove, FakeFunnelsGrove) {
+        let fake = FakeFunnelsGrove(answers: answers)
+        let clock = clock
+        let sleeps = sleeps
+        let sdk = FunnelsGrove(
+            configuration: .init(acceptTestSubscriptions: acceptTestSubscriptions),
+            store: store,
+            client: fake,
+            now: { clock.now },
+            sleep: { await sleeps.record($0) }
+        )
+        return (sdk, fake)
+    }
+
+    // MARK: - Links
+
+    func testHandleStoresTheUserAndEmailWithoutTrackingTheLogin() async {
+        let (sdk, fake) = makeSDK(answers: [active])
+
+        XCTAssertTrue(sdk.handle(link))
+
+        XCTAssertEqual(store.value, LinkedUser(userId: "u_1", email: "buyer@example.com"))
+        XCTAssertEqual(sdk.userId, "u_1")
+        XCTAssertEqual(sdk.email, "buyer@example.com")
+        let tracked = await fake.trackedUserIds
+        XCTAssertEqual(tracked, [])
+    }
+
+    func testHandleAcceptsACustomScheme() {
+        let (sdk, _) = makeSDK(answers: [active])
+
+        XCTAssertTrue(sdk.handle(URL(string: "fgdemo://open?user_id=u_1")!))
+        XCTAssertEqual(sdk.userId, "u_1")
+        XCTAssertNil(sdk.email)
+    }
+
+    func testHandleIgnoresLinksWithoutAUserId() {
+        let (sdk, _) = makeSDK(answers: [active])
+
+        XCTAssertFalse(sdk.handle(URL(string: "https://go.example.com/open?email=buyer%40example.com")!))
+        XCTAssertFalse(sdk.handle(URL(string: "myapp://profile?id=42")!))
+        XCTAssertNil(store.value)
+        XCTAssertNil(sdk.userId)
+        XCTAssertNil(sdk.email)
+    }
+
+    func testHandleKeepsTheUserInMemoryWhenTheKeychainFails() {
+        store.saveError = KeychainError(status: errSecIO)
+        let (sdk, _) = makeSDK(answers: [active])
+
+        XCTAssertTrue(sdk.handle(link))
+        XCTAssertEqual(sdk.userId, "u_1")
+        XCTAssertEqual(sdk.email, "buyer@example.com")
+    }
+
+    func testANewLinkReplacesTheStoredUserAndEmail() {
+        store.value = LinkedUser(userId: "u_old", email: "old@example.com")
+        let (sdk, _) = makeSDK(answers: [active])
+
+        sdk.handle(link)
+
+        XCTAssertEqual(store.value, LinkedUser(userId: "u_1", email: "buyer@example.com"))
+    }
+
+    func testALinkWithoutAnEmailKeepsTheEmailOfTheSameUser() {
+        store.value = LinkedUser(userId: "u_1", email: "buyer@example.com")
+        let (sdk, _) = makeSDK(answers: [active])
+
+        sdk.handle(URL(string: "fgdemo://open?user_id=u_1")!)
+
+        XCTAssertEqual(store.value, LinkedUser(userId: "u_1", email: "buyer@example.com"))
+    }
+
+    func testALinkWithAnUnusableEmailKeepsTheEmailOfTheSameUser() {
+        store.value = LinkedUser(userId: "u_1", email: "buyer@example.com")
+        let (sdk, _) = makeSDK(answers: [active])
+
+        sdk.handle(URL(string: "fgdemo://open?user_id=u_1&email=nonsense")!)
+
+        XCTAssertEqual(sdk.email, "buyer@example.com")
+    }
+
+    func testALinkWithoutAnEmailDropsTheEmailOfAnotherUser() {
+        store.value = LinkedUser(userId: "u_old", email: "old@example.com")
+        let (sdk, _) = makeSDK(answers: [active])
+
+        sdk.handle(URL(string: "fgdemo://open?user_id=u_1")!)
+
+        XCTAssertEqual(store.value, LinkedUser(userId: "u_1"))
+        XCTAssertNil(sdk.email)
+    }
+
+    func testANewEmailReplacesTheEmailOfTheSameUser() {
+        store.value = LinkedUser(userId: "u_1", email: "old@example.com")
+        let (sdk, _) = makeSDK(answers: [active])
+
+        sdk.handle(link)
+
+        XCTAssertEqual(sdk.email, "buyer@example.com")
+    }
+
+    func testHandleAcceptsABrowsingWebActivity() {
+        let (sdk, _) = makeSDK(answers: [active])
+        let activity = NSUserActivity(activityType: NSUserActivityTypeBrowsingWeb)
+        activity.webpageURL = link
+
+        XCTAssertTrue(sdk.handle(activity))
+        XCTAssertFalse(sdk.handle(NSUserActivity(activityType: "com.funnelsgrove.other")))
+    }
+
+    func testHandleIgnoresOtherActivityTypesEvenWithAURL() {
+        let (sdk, _) = makeSDK(answers: [active])
+        let activity = NSUserActivity(activityType: "com.funnelsgrove.other")
+        activity.webpageURL = link
+
+        XCTAssertFalse(sdk.handle(activity))
+        XCTAssertNil(store.value)
+    }
+
+    func testTheUserSurvivesANewInstance() {
+        store.value = LinkedUser(userId: "u_saved", email: "saved@example.com")
+        let (sdk, _) = makeSDK(answers: [active])
+
+        XCTAssertEqual(sdk.userId, "u_saved")
+        XCTAssertEqual(sdk.email, "saved@example.com")
+    }
+
+    func testTheUserIsReadAgainAfterAnEmptyRead() {
+        let (sdk, _) = makeSDK(answers: [active])
+        XCTAssertNil(sdk.userId)
+
+        store.value = LinkedUser(userId: "u_later")
+
+        XCTAssertEqual(sdk.userId, "u_later")
+    }
+
+    // MARK: - Subscription
+
+    func testCheckWithoutAUserSkipsTheNetwork() async throws {
+        let (sdk, fake) = makeSDK(answers: [active])
+
+        let status = try await sdk.checkSubscription()
+
+        XCTAssertEqual(status, SubscriptionStatus(isActive: false, isTest: false, isKnownUser: false, userId: nil))
+        let calls = await fake.verifiedUserIds
+        XCTAssertEqual(calls, [])
+    }
+
+    func testCheckReportsALiveSubscription() async throws {
+        store.value = LinkedUser(userId: "u_1")
+        let (sdk, _) = makeSDK(answers: [active])
+
+        let status = try await sdk.checkSubscription()
+
+        XCTAssertEqual(status, SubscriptionStatus(isActive: true, isTest: false, isKnownUser: true, userId: "u_1"))
+    }
+
+    func testCheckRejectsTestSubscriptionsByDefault() async throws {
+        store.value = LinkedUser(userId: "u_1")
+        let (sdk, _) = makeSDK(answers: [activeTest])
+
+        let status = try await sdk.checkSubscription()
+
+        XCTAssertEqual(status, SubscriptionStatus(isActive: false, isTest: true, isKnownUser: true, userId: "u_1"))
+    }
+
+    func testCheckAcceptsTestSubscriptionsWhenConfigured() async throws {
+        store.value = LinkedUser(userId: "u_1")
+        let (sdk, _) = makeSDK(answers: [activeTest], acceptTestSubscriptions: true)
+
+        let status = try await sdk.checkSubscription()
+
+        XCTAssertEqual(status, SubscriptionStatus(isActive: true, isTest: true, isKnownUser: true, userId: "u_1"))
+    }
+
+    func testCheckKeepsTheUserWhenFunnelsGroveDoesNotKnowIt() async throws {
+        store.value = LinkedUser(userId: "u_1", email: "buyer@example.com")
+        let (sdk, _) = makeSDK(answers: [unknown])
+
+        let status = try await sdk.checkSubscription()
+
+        XCTAssertEqual(status, SubscriptionStatus(isActive: false, isTest: false, isKnownUser: false, userId: "u_1"))
+        XCTAssertEqual(store.value, LinkedUser(userId: "u_1", email: "buyer@example.com"))
+    }
+
+    func testCheckPollsAfterAFreshLinkUntilActive() async throws {
+        let (sdk, fake) = makeSDK(answers: [inactive, inactive, active])
+        sdk.handle(link)
+
+        let status = try await sdk.checkSubscription()
+
+        XCTAssertTrue(status.isActive)
+        let calls = await fake.verifiedUserIds
+        XCTAssertEqual(calls.count, 3)
+        let delays = await sleeps.delays
+        XCTAssertEqual(delays, [1, 2])
+    }
+
+    func testCheckStopsPollingAfterAllDelays() async throws {
+        let (sdk, fake) = makeSDK(answers: [inactive])
+        sdk.handle(link)
+
+        let status = try await sdk.checkSubscription()
+
+        XCTAssertFalse(status.isActive)
+        let calls = await fake.verifiedUserIds
+        XCTAssertEqual(calls.count, 5)
+        let delays = await sleeps.delays
+        XCTAssertEqual(delays, [1, 2, 4, 8])
+    }
+
+    func testCheckDoesNotPollForAUserFromAnEarlierLaunch() async throws {
+        store.value = LinkedUser(userId: "u_1")
+        let (sdk, fake) = makeSDK(answers: [inactive])
+
+        _ = try await sdk.checkSubscription()
+
+        let calls = await fake.verifiedUserIds
+        XCTAssertEqual(calls.count, 1)
+    }
+
+    func testFreshLinkWindowIsTwoMinutes() async throws {
+        for (age, expectedCalls) in [(119.0, 5), (120.0, 1)] {
+            store = FakeUserStore()
+            let (sdk, fake) = makeSDK(answers: [inactive])
+            sdk.handle(link)
+            clock.now += age
+
+            _ = try await sdk.checkSubscription()
+
+            let calls = await fake.verifiedUserIds
+            XCTAssertEqual(calls.count, expectedCalls, "link age \(age) s")
+        }
+    }
+
+    func testCheckPassesFunnelsGroveErrorsThrough() async {
+        store.value = LinkedUser(userId: "u_1")
+        let (sdk, fake) = makeSDK(answers: [active])
+        await fake.failVerification(with: .server(statusCode: 500))
+
+        do {
+            _ = try await sdk.checkSubscription()
+            XCTFail("Expected an error")
+        } catch {
+            XCTAssertEqual(error as? FunnelsGroveError, .server(statusCode: 500))
+        }
+    }
+
+    func testCheckAnswersForALinkThatArrivedDuringTheRequest() async throws {
+        store.value = LinkedUser(userId: "u_old")
+        let (sdk, fake) = makeSDK(answers: [active])
+        let newLink = URL(string: "fgdemo://open?user_id=u_new")!
+        await fake.duringNextVerify { await MainActor.run { _ = sdk.handle(newLink) } }
+
+        let status = try await sdk.checkSubscription()
+
+        XCTAssertEqual(status.userId, "u_new")
+        let calls = await fake.verifiedUserIds
+        XCTAssertEqual(calls, ["u_old", "u_new"])
+    }
+
+    func testCheckReportsNoUserAfterAResetDuringTheRequest() async throws {
+        store.value = LinkedUser(userId: "u_1")
+        let (sdk, fake) = makeSDK(answers: [active])
+        await fake.duringNextVerify { await MainActor.run { sdk.reset() } }
+
+        let status = try await sdk.checkSubscription()
+
+        XCTAssertEqual(status, SubscriptionStatus(isActive: false, isTest: false, isKnownUser: false, userId: nil))
+        let calls = await fake.verifiedUserIds
+        XCTAssertEqual(calls, ["u_1"])
+    }
+
+    func testCheckStopsPollingTheOldUserWhenANewLinkArrives() async throws {
+        let (sdk, fake) = makeSDK(answers: [inactive])
+        sdk.handle(link)
+        let newLink = URL(string: "fgdemo://open?user_id=u_2")!
+        await fake.duringNextVerify { await MainActor.run { _ = sdk.handle(newLink) } }
+
+        let status = try await sdk.checkSubscription()
+
+        XCTAssertEqual(status.userId, "u_2")
+        let calls = await fake.verifiedUserIds
+        XCTAssertEqual(calls, ["u_1"] + Array(repeating: "u_2", count: 5))
+    }
+
+    // MARK: - Login
+
+    func testTrackLoginWithoutAUserSkipsTheNetwork() async throws {
+        let (sdk, fake) = makeSDK(answers: [active])
+
+        let tracked = try await sdk.trackLogin()
+
+        XCTAssertFalse(tracked)
+        let calls = await fake.trackedUserIds
+        XCTAssertEqual(calls, [])
+    }
+
+    func testTrackLoginRecordsTheStoredUser() async throws {
+        store.value = LinkedUser(userId: "u_1")
+        let (sdk, fake) = makeSDK(answers: [active])
+
+        let tracked = try await sdk.trackLogin()
+
+        XCTAssertTrue(tracked)
+        let calls = await fake.trackedUserIds
+        XCTAssertEqual(calls, ["u_1"])
+    }
+
+    func testTrackLoginRecordsTheUserOfTheLatestLink() async throws {
+        store.value = LinkedUser(userId: "u_old")
+        let (sdk, fake) = makeSDK(answers: [active])
+        sdk.handle(link)
+
+        try await sdk.trackLogin()
+
+        let calls = await fake.trackedUserIds
+        XCTAssertEqual(calls, ["u_1"])
+    }
+
+    func testTrackLoginPassesErrorsThrough() async {
+        store.value = LinkedUser(userId: "u_1")
+        let (sdk, fake) = makeSDK(answers: [active])
+        await fake.failTracking(with: .unknownUser)
+
+        do {
+            try await sdk.trackLogin()
+            XCTFail("Expected an error")
+        } catch {
+            XCTAssertEqual(error as? FunnelsGroveError, .unknownUser)
+        }
+    }
+
+    // MARK: - Reset
+
+    func testResetForgetsTheUserAndEmail() async throws {
+        let (sdk, fake) = makeSDK(answers: [inactive])
+        sdk.handle(link)
+
+        sdk.reset()
+        let status = try await sdk.checkSubscription()
+        let tracked = try await sdk.trackLogin()
+
+        XCTAssertNil(store.value)
+        XCTAssertNil(sdk.userId)
+        XCTAssertNil(sdk.email)
+        XCTAssertNil(status.userId)
+        XCTAssertFalse(tracked)
+        let calls = await fake.verifiedUserIds
+        XCTAssertEqual(calls, [])
+    }
+
+    func testResetAlsoForgetsWhenTheLinkArrived() async throws {
+        let (sdk, fake) = makeSDK(answers: [inactive])
+        sdk.handle(link)
+        sdk.reset()
+        store.value = LinkedUser(userId: "u_synced")
+
+        _ = try await sdk.checkSubscription()
+
+        let calls = await fake.verifiedUserIds
+        XCTAssertEqual(calls, ["u_synced"])
+    }
+
+    // MARK: - Configuration
+
+    func testAcceptsAPublishableKey() {
+        XCTAssertNil(FunnelsGrove.publishableKeyProblem("sdk_pub_" + String(repeating: "a", count: 48)))
+        // Not tied to today's format: a new kind of publishable key must not stop apps.
+        XCTAssertNil(FunnelsGrove.publishableKeyProblem("pk_future_format"))
+    }
+
+    func testRefusesAnEmptyOrSpacedKey() {
+        for key in ["", " sdk_pub_1", "sdk_pub_1\n", "sdk pub"] {
+            XCTAssertEqual(
+                FunnelsGrove.publishableKeyProblem(key),
+                "publishableKey must be the SDK publishable key of your FunnelsGrove project, without spaces",
+                key
+            )
+        }
+    }
+
+    func testRefusesSecretKeys() {
+        for key in ["sdk_sec_123", "fg_key_123"] {
+            XCTAssertEqual(
+                FunnelsGrove.publishableKeyProblem(key),
+                "publishableKey is a secret FunnelsGrove key: never ship it in an app, use the SDK publishable key",
+                key
+            )
+        }
+    }
+}
+```
+
+- [ ] **Step 3: Убедиться, что тест падает**
+
+```bash
+cd /Users/e/work2/appsilove/funnelsgrove-ios-sdk && swift test
+```
+
+Ожидается: компиляция падает с `error: cannot find 'SubscriptionStatus' in scope` и `cannot find 'FunnelsGrove' in scope`.
+
+- [ ] **Step 4: Написать `Sources/FunnelsGroveSDK/SubscriptionStatus.swift`**
+
+```swift
+import Foundation
+
+/// The result of `FunnelsGrove.checkSubscription()`.
+public struct SubscriptionStatus: Sendable, Equatable {
+    /// FunnelsGrove reports an active subscription, and it is either live or test subscriptions are accepted.
+    public let isActive: Bool
+    /// The subscription was bought in Stripe test mode.
+    public let isTest: Bool
+    /// FunnelsGrove knows the stored user in this project.
+    public let isKnownUser: Bool
+    /// The stored FunnelsGrove user ID, or `nil` before the first link or after `reset()`.
+    public let userId: String?
+
+    public init(isActive: Bool, isTest: Bool, isKnownUser: Bool, userId: String?) {
+        self.isActive = isActive
+        self.isTest = isTest
+        self.isKnownUser = isKnownUser
+        self.userId = userId
+    }
+}
+```
+
+- [ ] **Step 5: Написать `Sources/FunnelsGroveSDK/FunnelsGrove.swift`**
+
+```swift
+import Foundation
+import os
+
+private let logger = Logger(subsystem: "com.funnelsgrove.sdk", category: "FunnelsGrove")
+
+/// Receives FunnelsGrove links, checks the subscription of the linked user and records app logins.
+@MainActor
+public final class FunnelsGrove {
+    struct Configuration {
+        let acceptTestSubscriptions: Bool
+    }
+
+    /// Within this time after a link, an inactive answer is polled again: the payment webhook may lag.
+    static let freshLinkWindow: TimeInterval = 120
+    static let freshLinkRetryDelays: [TimeInterval] = [1, 2, 4, 8]
+
+    private static var instance: FunnelsGrove?
+
+    /// The instance created by `configure`. Using it before `configure` stops the app.
+    public static var shared: FunnelsGrove {
+        guard let instance else {
+            preconditionFailure("Call FunnelsGrove.configure(publishableKey:) before FunnelsGrove.shared")
+        }
+        return instance
+    }
+
+    /// Call once at launch, before any link can arrive.
+    /// - Parameters:
+    ///   - publishableKey: The SDK publishable key of your FunnelsGrove project. Never a secret key.
+    ///   - acceptTestSubscriptions: Treat Stripe test-mode subscriptions as active. Use only in QA builds.
+    ///   - apiBaseURL: The FunnelsGrove SDK API origin.
+    public static func configure(
+        publishableKey: String,
+        acceptTestSubscriptions: Bool = false,
+        apiBaseURL: URL = URL(string: "https://sdk-api.funnelsgrove.com")!
+    ) {
+        if let problem = publishableKeyProblem(publishableKey) {
+            preconditionFailure(problem)
+        }
+        instance = FunnelsGrove(
+            configuration: Configuration(acceptTestSubscriptions: acceptTestSubscriptions),
+            store: KeychainUserStore(),
+            client: FunnelsGroveClient(baseURL: apiBaseURL, publishableKey: publishableKey)
+        )
+    }
+
+    /// Why `configure` refuses `key`, or `nil`. The format of publishable keys is not checked, so that a new
+    /// FunnelsGrove key format cannot stop apps.
+    static func publishableKeyProblem(_ key: String) -> String? {
+        if key.isEmpty || key.contains(where: \.isWhitespace) {
+            return "publishableKey must be the SDK publishable key of your FunnelsGrove project, without spaces"
+        }
+        // Anyone who downloads the app can read a key shipped in it.
+        if key.hasPrefix("sdk_sec_") || key.hasPrefix("fg_key_") {
+            return "publishableKey is a secret FunnelsGrove key: never ship it in an app, use the SDK publishable key"
+        }
+        return nil
+    }
+
+    private let configuration: Configuration
+    private let store: UserStore
+    private let client: FunnelsGroveAPI
+    private let now: () -> Date
+    private let sleep: Sleep
+    private var cachedUser: LinkedUser?
+    private var linkedAt: Date?
+
+    init(
+        configuration: Configuration,
+        store: UserStore,
+        client: FunnelsGroveAPI,
+        now: @escaping () -> Date = Date.init,
+        sleep: @escaping Sleep = sleepSeconds
+    ) {
+        self.configuration = configuration
+        self.store = store
+        self.client = client
+        self.now = now
+        self.sleep = sleep
+    }
+
+    /// The FunnelsGrove user ID from the latest link, if any.
+    public var userId: String? { user?.userId }
+
+    /// The email the links carried for the stored user, if any. Not verified: it is the address the buyer typed in
+    /// the funnel, and anyone with the link has it. Fine for a sign-up form or a "signed in as" label, not as proof
+    /// that the user owns the address.
+    public var email: String? { user?.email }
+
+    private var user: LinkedUser? {
+        // An empty read, for example before the first unlock after a reboot, is not cached: the next access tries again.
+        if cachedUser == nil { cachedUser = store.read() }
+        return cachedUser
+    }
+
+    /// Stores the user ID and email from a FunnelsGrove link: any URL, whatever its scheme and host, with a valid
+    /// `user_id`. Returns `false` for any other URL, which the app handles itself; route your own links first.
+    /// After `true`, call `checkSubscription()` again: a check that already finished saw the previous user.
+    /// No login is recorded: call `trackLogin()` when your app signs the user in.
+    @discardableResult
+    public func handle(_ url: URL) -> Bool {
+        guard let linked = LinkParser.user(from: url) else {
+            return false
+        }
+        let previous = user
+        // A link without an email keeps the address of the same user, but never pairs another user's address with
+        // the new ID.
+        let email = linked.email ?? (previous?.userId == linked.userId ? previous?.email : nil)
+        keep(LinkedUser(userId: linked.userId, email: email))
+        linkedAt = now()
+        return true
+    }
+
+    /// Handles a Universal Link delivered as a browsing-web user activity.
+    @discardableResult
+    public func handle(_ userActivity: NSUserActivity) -> Bool {
+        guard userActivity.activityType == NSUserActivityTypeBrowsingWeb,
+              let url = userActivity.webpageURL
+        else {
+            return false
+        }
+        return handle(url)
+    }
+
+    /// Asks FunnelsGrove whether the stored user has an active subscription. The answer is not cached.
+    ///
+    /// Right after a link an inactive answer is polled for up to about 15 seconds, because the payment webhook
+    /// may lag: show progress instead of blocking launch on it. Throws `FunnelsGroveError`, or `CancellationError`
+    /// when the calling task is cancelled (for example a SwiftUI `.task` whose view went away), which is no result
+    /// rather than a failure. If a link or `reset()` arrives meanwhile, the answer is for the current user.
+    public func checkSubscription() async throws -> SubscriptionStatus {
+        while true {
+            guard let checked = userId else {
+                return SubscriptionStatus(isActive: false, isTest: false, isKnownUser: false, userId: nil)
+            }
+            var response = try await client.verifySubscription(userId: checked)
+            if !response.active, isFreshLink {
+                for delay in Self.freshLinkRetryDelays {
+                    try await sleep(delay)
+                    guard userId == checked else { break }
+                    response = try await client.verifySubscription(userId: checked)
+                    if response.active { break }
+                }
+            }
+            // A link or reset() that arrived while waiting made this answer stale: ask again for the current user.
+            guard userId == checked else { continue }
+            return SubscriptionStatus(
+                isActive: response.active && (!response.test || configuration.acceptTestSubscriptions),
+                isTest: response.test,
+                isKnownUser: response.user != nil,
+                userId: checked
+            )
+        }
+    }
+
+    /// Records "Logged into app" in FunnelsGrove for the stored user. Call it when your app signs the user in or up;
+    /// in an app without a sign-in of its own, after `handle` returns `true`; and again after `handle` returns `true`
+    /// while the user is signed in. A repeated call for the same user records nothing new.
+    ///
+    /// Returns `false` without a network call when no user is stored, and `true` once FunnelsGrove has the login.
+    /// The login goes to the user stored when the call starts. Throws `FunnelsGroveError.unknownUser` when
+    /// FunnelsGrove has no such user in the project, another `FunnelsGroveError`, or `CancellationError`.
+    @discardableResult
+    public func trackLogin() async throws -> Bool {
+        guard let userId else {
+            return false
+        }
+        try await client.trackLogin(userId: userId)
+        logger.info("Recorded the login of FunnelsGrove user \(userId, privacy: .private)")
+        return true
+    }
+
+    /// Forgets the stored user and email on this device and, through iCloud Keychain, on the user's other devices.
+    public func reset() {
+        store.delete()
+        cachedUser = nil
+        linkedAt = nil
+    }
+
+    /// Stores the user, kept in memory when the keychain fails.
+    private func keep(_ user: LinkedUser) {
+        do {
+            try store.save(user)
+        } catch {
+            logger.error("Keeping the user failed: \(String(describing: error), privacy: .public)")
+        }
+        cachedUser = user
+        logger.info("Linked FunnelsGrove user \(user.userId, privacy: .private)")
+    }
+
+    private var isFreshLink: Bool {
+        guard let linkedAt else { return false }
+        return now().timeIntervalSince(linkedAt) < Self.freshLinkWindow
+    }
+}
+```
+
+- [ ] **Step 6: Убедиться, что тесты проходят на macOS**
+
+```bash
+cd /Users/e/work2/appsilove/funnelsgrove-ios-sdk && swift test 2>&1 | grep -E "warning:|error:|Executed 64"
+```
+
+Ожидается: одна строка `Executed 64 tests, with 0 failures`, без `warning:` и `error:`.
+
+- [ ] **Step 7: Убедиться, что тесты проходят на iOS-симуляторе**
+
+```bash
+cd /Users/e/work2/appsilove/funnelsgrove-ios-sdk
+DEVICE_ID=$(xcrun simctl list devices available | grep -m1 -E '^\s+iPhone' | grep -oE '[0-9A-F-]{36}')
+: "${DEVICE_ID:?no available iPhone simulator}"
+xcodebuild test -scheme FunnelsGroveSDK -destination "platform=iOS Simulator,id=$DEVICE_ID" 2>&1 | grep -E "error:|Executed 64|TEST (SUCCEEDED|FAILED)"
+```
+
+Ожидается: `Executed 64 tests, with 0 failures` и `** TEST SUCCEEDED **`. Строка `appintentsmetadataprocessor … warning: Metadata extraction skipped` — шум `xcodebuild`, не от пакета.
+
+- [ ] **Step 8: Commit**
+
+```bash
+cd /Users/e/work2/appsilove/funnelsgrove-ios-sdk
+git add Sources/FunnelsGroveSDK/SubscriptionStatus.swift Sources/FunnelsGroveSDK/FunnelsGrove.swift Tests/FunnelsGroveSDKTests/Fakes.swift Tests/FunnelsGroveSDKTests/FunnelsGroveTests.swift
+git commit -m "feat: add the FunnelsGrove facade for links, subscription checks and app logins" -m "Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
+```
+
+---
+
+### Task 6: README
+
+**Files:**
+- Create: `README.md`
+
+README пишется для клиентов FG, на английском. Дизайн и риски в нём не пересказываются, кроме того, что нужно для безопасной интеграции. Примеры кода из него компилируются: SwiftUI-пример и методы `SceneDelegate` проверены в демо-проекте 2 ноября.
+
+- [ ] **Step 1: Написать `README.md`**
+
+````markdown
+# FunnelsGroveSDK
+
+Links a FunnelsGrove web purchase to your iOS app. After checkout, the funnel's "Open app now" button and the purchase
+email open your app with a link that carries the buyer's FunnelsGrove user ID and email, for example
+`myapp://open?user_id=u_…&email=…`. The SDK keeps them in the keychain, asks FunnelsGrove whether the user's
+subscription is active, and records "Logged into app" in FunnelsGrove when your app says the user signed in.
+
+The link works like a bearer token: whoever has it gets the subscription status of its user and the buyer's email.
+Don't treat the result as proof of ownership, and don't log the link, the user ID or the email, or send them to
+analytics or support tools.
+
+## How a buyer reaches the app
+
+- The buyer taps "Open app now" on the funnel's success page, or the link in the purchase email. If the app is
+  installed, iOS opens it with the link.
+- If the app is not installed, the link cannot open it. The buyer installs the app from the App Store button on the
+  same page and taps "Open app now" again: there is no deferred deep link.
+- The funnel also opens the link once by itself. iOS often does not open the app for that, so the purchase is linked
+  by a later tap.
+- In-app browsers such as TikTok's or Instagram's often don't open the app at all.
+
+## Requirements
+
+- iOS 15+, Xcode 16+.
+- The SDK publishable key of your FunnelsGrove project. Never put a secret key (`sdk_sec_…`) or an organization API
+  key (`fg_key_…`) in an app: anyone who downloads it can read the key, so `configure` stops the app if you pass one.
+- A FunnelsGrove project whose funnel links to your app, see below.
+
+## Set up your FunnelsGrove project
+
+In the project settings, point at least one of these fields at your app, then publish the funnel:
+
+- **App Store deeplink**: a link with your app's own scheme, for example `myapp://open`. On iOS, "Open app now"
+  uses it first.
+- **Web link**: a Universal Link on your domain, for example `https://go.myapp.com/open`. The purchase email uses it
+  first.
+
+FunnelsGrove adds `user_id`, `email` and the first-touch campaign parameters to both. Check that "Open app now" in the
+published funnel opens your app and that the link carries `user_id`.
+
+## Install
+
+Add the package `https://github.com/The-Solid-Grove/funnelsgrove-ios-sdk.git` and link the `FunnelsGroveSDK`
+product. The repository is private for now: ask the FunnelsGrove team for access. There is no release tag yet: until
+the prototype is merged, add the package by branch `feat/sdk-prototype`, and after that by `main`.
+
+## Links into the app
+
+The SDK accepts any link with a `user_id`, whatever its scheme and host. Which links open your app is up to you:
+
+- **Custom scheme.** Add a URL type with your scheme: Target → Info → URL Types, or `CFBundleURLTypes`.
+- **Universal Links.** Add the Associated Domains capability with `applinks:<your domain>` and serve an
+  `apple-app-site-association` file for your Team ID and bundle ID from that domain. Apple's CDN can take up to
+  24 hours to pick up a new file, so publish it before you ship the build.
+  - Debug builds can use `applinks:<your domain>?mode=developer`. The device then reads the file from your server
+    directly. This needs Developer Mode (Settings → Privacy & Security) and Settings → Developer → Associated
+    Domains Development.
+  - Release and TestFlight builds must use the plain `applinks:<your domain>`.
+
+If your app has its own links with a `user_id` parameter, handle them before the SDK: it takes any link with a valid
+`user_id` for a FunnelsGrove link.
+
+## Use
+
+### SwiftUI
+
+```swift
+import FunnelsGroveSDK
+import SwiftUI
+
+@main
+struct MyApp: App {
+    @State private var hasAccess = false
+
+    init() {
+        FunnelsGrove.configure(publishableKey: "<FunnelsGrove SDK publishable key>")
+    }
+
+    var body: some Scene {
+        WindowGroup {
+            RootView(hasAccess: hasAccess)
+                .task { await refreshAccess() }
+                // A custom-scheme link arrives in onOpenURL. SwiftUI routes a Universal Link to one of these two
+                // handlers; register both.
+                .onOpenURL { url in
+                    // Handle your own links first.
+                    if FunnelsGrove.shared.handle(url) { linked() }
+                }
+                .onContinueUserActivity(NSUserActivityTypeBrowsingWeb) { activity in
+                    if FunnelsGrove.shared.handle(activity) { linked() }
+                }
+        }
+    }
+
+    @MainActor
+    private func linked() {
+        // A check that already finished saw the previous user: check again.
+        Task { await refreshAccess() }
+        // This app has no sign-in of its own, so the link is the login: see "App login".
+        Task { try? await FunnelsGrove.shared.trackLogin() }
+    }
+
+    @MainActor
+    private func refreshAccess() async {
+        do {
+            hasAccess = try await FunnelsGrove.shared.checkSubscription().isActive
+        } catch is CancellationError {
+            // The task was cancelled, for example the view went away: keep the current state.
+        } catch {
+            // FunnelsGroveError: see "Errors" below.
+        }
+    }
+}
+```
+
+Which of the two handlers receives a Universal Link depends on the SwiftUI version and on the other handlers in your
+app, so the example registers both. If both ever fire for one link, the second `handle` stores the same user again
+and FunnelsGrove records the login once, so nothing breaks. Check a cold and a warm start on a device.
+
+### UIKit
+
+```swift
+// AppDelegate.application(_:didFinishLaunchingWithOptions:)
+FunnelsGrove.configure(publishableKey: "<FunnelsGrove SDK publishable key>")
+
+// SceneDelegate
+func scene(_ scene: UIScene, willConnectTo session: UISceneSession, options connectionOptions: UIScene.ConnectionOptions) {
+    // A cold start may come from a link; check access either way.
+    connectionOptions.urlContexts.forEach { FunnelsGrove.shared.handle($0.url) }
+    connectionOptions.userActivities.forEach { FunnelsGrove.shared.handle($0) }
+    refreshAccess()
+}
+
+func scene(_ scene: UIScene, openURLContexts URLContexts: Set<UIOpenURLContext>) {
+    // A custom-scheme link while the app runs.
+    let linked = URLContexts.map { FunnelsGrove.shared.handle($0.url) }.contains(true)
+    if linked { refreshAccess() }
+}
+
+func scene(_ scene: UIScene, continue userActivity: NSUserActivity) {
+    // A Universal Link while the app runs.
+    if FunnelsGrove.shared.handle(userActivity) { refreshAccess() }
+}
+```
+
+`refreshAccess()` is your own function that calls `checkSubscription()`, like the SwiftUI example. Record the login
+as described in [App login](#app-login).
+
+`FunnelsGrove.shared` stops the app if `configure` has not run, so configure it in
+`application(_:didFinishLaunchingWithOptions:)`.
+
+Check access at launch, after every `handle` that returns `true`, and at every paid-content boundary.
+
+### App login
+
+`trackLogin()` records "Logged into app" for the stored user in FunnelsGrove. The SDK never calls it by itself. Call
+it:
+
+- when your app signs the user in or up;
+- in an app without a sign-in of its own, after `handle` returns `true`, as in the SwiftUI example;
+- again after `handle` returns `true` while the user is signed in: the link may be another FunnelsGrove user's.
+
+```swift
+// After your own sign-in succeeds.
+Task { try? await FunnelsGrove.shared.trackLogin() }
+```
+
+It returns `false` without a network call when no user is stored, so you can call it on every sign-in. A repeated call
+for the same user records nothing new. The login goes to the user stored when the call starts.
+
+### Email from the link
+
+`FunnelsGrove.shared.email` is the address the buyer bought with, when a link carried it. Use it to prefill a sign-up
+form or to show who is signed in. It is not verified: it is what the buyer typed in the funnel, and anyone with the
+link has it. A newer link without an email keeps the address of the same user and clears it for another user.
+
+## Behaviour
+
+- **`handle(_:)`** accepts any URL with a `user_id` query parameter (non-empty, at most 256 UTF-8 bytes, no
+  whitespace or control characters; the first one counts). It stores the ID together with the link's `email`, and a
+  newer link replaces them. It returns `true` and records no login. Any other URL returns `false` and is left to the
+  app. `userId` and `email` read what is stored.
+- **`handle(_ activity:)`** uses the activity's `webpageURL` when its type is `NSUserActivityTypeBrowsingWeb`, and
+  returns `false` otherwise.
+- **`checkSubscription()`**:
+  - without a stored ID returns at once, without a network call;
+  - within 2 minutes of a link keeps asking for up to ~15 s while FunnelsGrove still says inactive, because the
+    payment webhook may lag: show progress instead of blocking launch on it;
+  - retries a 503 once when `Retry-After` is 10 s or less;
+  - answers `isKnownUser: false` when FunnelsGrove does not know the stored ID in your project, for example after a
+    link from another project's funnel; the ID stays stored;
+  - never caches the answer;
+  - if a link or `reset()` changes the stored user while it waits, answers for the current user;
+  - throws `CancellationError` when its task is cancelled (for example a SwiftUI `.task` whose view went away):
+    treat that as no result, not as a failure.
+- **`trackLogin()`** returns `false` without a stored ID, retries a 503 once like `checkSubscription()`, and throws
+  `.unknownUser` when FunnelsGrove does not know the user in your project.
+- **Test subscriptions.** `isActive` is `false` for Stripe test-mode subscriptions unless you pass
+  `acceptTestSubscriptions: true` to `configure`. `isTest` is reported either way. Pass a flag that only your QA
+  build configuration sets, for example `acceptTestSubscriptions: isQABuild`, never `true` in release builds.
+- **Errors.** `FunnelsGroveError.configuration` for 400/401 (check the key), `.server(statusCode:)`,
+  `.network(URLError)` and, from `trackLogin()`, `.unknownUser`. A 400 from `trackLogin()` can also mean that the same
+  user ID exists in several funnels of the project: FunnelsGrove then needs a funnel ID that the link does not carry.
+  Switch over `FunnelsGroveError` with a `default` case: later versions may add cases. The SDK does not cache the
+  subscription answer, so offline every check for a stored user fails with `.network`: decide whether your app keeps
+  the access it last saw or locks paid content.
+- **Storage.** The ID and the email live in one keychain item with iCloud Keychain sync. It outlives app deletion in
+  practice; Apple does not guarantee that. A reinstall or a new device of the same Apple ID can therefore show the
+  previous user's access until a new link arrives. Call `reset()` on sign-out; other devices drop the user once
+  iCloud Keychain syncs.
+
+## Testing a link
+
+Tap a Universal Link in Notes or Messages: typed into Safari's address bar, it opens the web page instead of the app.
+On the simulator, `xcrun simctl openurl booted 'myapp://open?user_id=u_test'` opens a custom-scheme link.
+
+## Demo app
+
+```bash
+brew install xcodegen
+cd Examples/FunnelsGroveDemo
+cp Config/Local.xcconfig.example Config/Local.xcconfig   # set DEVELOPMENT_TEAM and FG_PUBLISHABLE_KEY
+xcodegen generate
+open FunnelsGroveDemo.xcodeproj
+```
+
+The demo opens `fgdemo://` links: set the App Store deeplink of your test FunnelsGrove project to `fgdemo://open`, or
+paste a link into the demo. Universal Links are optional: see `Config/Local.xcconfig.example`. Track login records a
+real login in that FunnelsGrove project.
+
+## Tests
+
+```bash
+swift test
+DEVICE_ID=$(xcrun simctl list devices available | grep -m1 -E '^\s+iPhone' | grep -oE '[0-9A-F-]{36}')
+: "${DEVICE_ID:?no available iPhone simulator}"
+xcodebuild test -scheme FunnelsGroveSDK -destination "platform=iOS Simulator,id=$DEVICE_ID"
+```
+
+The keychain is not unit-tested: an unsigned test bundle gets `errSecMissingEntitlement`. Check it in the demo app
+(relaunch, then delete and reinstall).
+````
+
+- [ ] **Step 2: Проверить, что README называет весь публичный API**
+
+```bash
+cd /Users/e/work2/appsilove/funnelsgrove-ios-sdk
+for name in 'configure(publishableKey' 'FunnelsGrove.shared' 'handle(' '`userId`' '`email`' 'checkSubscription()' 'trackLogin()' 'reset()' 'acceptTestSubscriptions' 'isKnownUser' 'unknownUser'; do grep -qF "$name" README.md && echo "ok   $name" || echo "MISS $name"; done
+```
+
+Ожидается: все 11 строк начинаются с `ok`.
+
+- [ ] **Step 3: Commit**
+
+```bash
+cd /Users/e/work2/appsilove/funnelsgrove-ios-sdk
+git add README.md
+git commit -m "docs: explain integration, the FunnelsGrove project setup, behaviour, demo and tests" -m "Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
+```
+
+---
+
+### Task 7: Демо-приложение
+
+**Files:**
+- Create: `Examples/FunnelsGroveDemo/project.yml`
+- Create: `Examples/FunnelsGroveDemo/Config/Shared.xcconfig`
+- Create: `Examples/FunnelsGroveDemo/Config/Debug.xcconfig`
+- Create: `Examples/FunnelsGroveDemo/Config/Release.xcconfig`
+- Create: `Examples/FunnelsGroveDemo/Config/Local.xcconfig.example`
+- Create: `Examples/FunnelsGroveDemo/Config/UniversalLinks.entitlements`
+- Create: `Examples/FunnelsGroveDemo/FunnelsGroveDemo/FunnelsGroveDemoApp.swift`
+- Create: `Examples/FunnelsGroveDemo/FunnelsGroveDemo/DemoConfig.swift`
+- Create: `Examples/FunnelsGroveDemo/FunnelsGroveDemo/ContentView.swift`
+
+XcodeGen генерирует `FunnelsGroveDemo.xcodeproj` и `Support/Info.plist`, оба в `.gitignore`. Publishable key попадает в Info.plist из xcconfig. Своя схема `fgdemo` прописана в `CFBundleURLTypes`, поэтому ссылку можно проверить без AASA.
+
+Universal Links выключены по умолчанию: `CODE_SIGN_ENTITLEMENTS` пустой, и сборка подписывается любой командой, в том числе бесплатной. Владелец включает их в `Local.xcconfig`, задав `FG_DEMO_LINK_HOST` и `CODE_SIGN_ENTITLEMENTS = Config/UniversalLinks.entitlements`. Xcode подставляет build settings в entitlements при подписи, а `?mode=developer` стоит только в Debug.
+
+- [ ] **Step 1: Проверить XcodeGen**
+
+```bash
+xcodegen --version || brew install xcodegen
+```
+
+Ожидается: `Version: 2.46.0` или новее.
+
+- [ ] **Step 2: Написать `Examples/FunnelsGroveDemo/project.yml`**
+
+```yaml
+name: FunnelsGroveDemo
+options:
+  deploymentTarget:
+    iOS: "17.0"
+packages:
+  FunnelsGroveSDK:
+    path: ../..
+targets:
+  FunnelsGroveDemo:
+    type: application
+    platform: iOS
+    sources:
+      - FunnelsGroveDemo
+    configFiles:
+      Debug: Config/Debug.xcconfig
+      Release: Config/Release.xcconfig
+    dependencies:
+      - package: FunnelsGroveSDK
+    info:
+      path: Support/Info.plist
+      properties:
+        CFBundleDisplayName: FunnelsGrove Demo
+        CFBundleShortVersionString: "1.0"
+        CFBundleVersion: "1"
+        UILaunchScreen: {}
+        FGPublishableKey: "$(FG_PUBLISHABLE_KEY)"
+        CFBundleURLTypes:
+          - CFBundleURLName: "$(PRODUCT_BUNDLE_IDENTIFIER)"
+            CFBundleURLSchemes:
+              - fgdemo
+    settings:
+      base:
+        CODE_SIGN_STYLE: Automatic
+    scheme: {}
+```
+
+- [ ] **Step 3: Написать xcconfig-файлы и entitlements**
+
+`Examples/FunnelsGroveDemo/Config/Shared.xcconfig`:
+
+```
+// Shared demo settings. Put your own values in Local.xcconfig (git-ignored).
+PRODUCT_BUNDLE_IDENTIFIER = com.funnelsgrove.demo
+FG_PUBLISHABLE_KEY =
+DEVELOPMENT_TEAM =
+// Universal Links are off unless Local.xcconfig sets both (see Local.xcconfig.example).
+FG_DEMO_LINK_HOST =
+CODE_SIGN_ENTITLEMENTS =
+
+#include? "Local.xcconfig"
+```
+
+`Examples/FunnelsGroveDemo/Config/Debug.xcconfig`:
+
+```
+#include "Shared.xcconfig"
+
+// With Universal Links on: read the AASA file from the server, bypassing Apple's CDN. Needs Developer Mode on the device.
+FG_DEMO_LINK_MODE = ?mode=developer
+```
+
+`Examples/FunnelsGroveDemo/Config/Release.xcconfig`:
+
+```
+#include "Shared.xcconfig"
+
+FG_DEMO_LINK_MODE =
+```
+
+`Examples/FunnelsGroveDemo/Config/Local.xcconfig.example`:
+
+```
+// Copy to Local.xcconfig (git-ignored) and fill in.
+DEVELOPMENT_TEAM = ABCDE12345
+FG_PUBLISHABLE_KEY = your-funnelsgrove-project-sdk-publishable-key
+// PRODUCT_BUNDLE_IDENTIFIER = com.funnelsgrove.demo
+
+// Optional Universal Links: a host whose apple-app-site-association file lists <Team ID>.<bundle ID>,
+// for example a fgdemo row in Appsilove's link_apps. Uncomment both lines.
+// FG_DEMO_LINK_HOST = fgdemo.links.appsilove.co
+// CODE_SIGN_ENTITLEMENTS = Config/UniversalLinks.entitlements
+```
+
+`Examples/FunnelsGroveDemo/Config/UniversalLinks.entitlements`:
+
+```xml
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>com.apple.developer.associated-domains</key>
+	<array>
+		<string>applinks:$(FG_DEMO_LINK_HOST)$(FG_DEMO_LINK_MODE)</string>
+	</array>
+</dict>
+</plist>
+```
+
+- [ ] **Step 4: Написать `Examples/FunnelsGroveDemo/FunnelsGroveDemo/FunnelsGroveDemoApp.swift`**
+
+```swift
+import FunnelsGroveSDK
+import SwiftUI
+
+@main
+struct FunnelsGroveDemoApp: App {
+    init() {
+        // A QA app: it must show Stripe test-mode purchases as active. Real apps never pass true in release builds.
+        FunnelsGrove.configure(publishableKey: DemoConfig.publishableKey, acceptTestSubscriptions: true)
+    }
+
+    var body: some Scene {
+        WindowGroup {
+            ContentView()
+        }
+    }
+}
+```
+
+- [ ] **Step 5: Написать `Examples/FunnelsGroveDemo/FunnelsGroveDemo/DemoConfig.swift`**
+
+```swift
+import Foundation
+
+/// Values come from Config/Local.xcconfig through Info.plist.
+enum DemoConfig {
+    static let publishableKey = value(for: "FGPublishableKey")
+
+    private static func value(for key: String) -> String {
+        guard let value = Bundle.main.object(forInfoDictionaryKey: key) as? String, !value.isEmpty else {
+            preconditionFailure("\(key) is empty: fill in Config/Local.xcconfig")
+        }
+        return value
+    }
+}
+```
+
+- [ ] **Step 6: Написать `Examples/FunnelsGroveDemo/FunnelsGroveDemo/ContentView.swift`**
+
+Экран: сохранённые `user_id` и email, статус и Check, Track login с результатом, полученные ссылки с обработчиком, поле для вставки ссылки и Reset. Демо не вызывает `trackLogin()` само после ссылки: в E2E вход проверяется отдельной кнопкой.
+
+```swift
+import FunnelsGroveSDK
+import SwiftUI
+
+struct ContentView: View {
+    private static let loginHint = "Records Logged into app in FunnelsGrove for the stored user"
+
+    @State private var userId = FunnelsGrove.shared.userId
+    @State private var email = FunnelsGrove.shared.email
+    @State private var status = "Not checked"
+    @State private var isChecking = false
+    @State private var loginStatus = Self.loginHint
+    @State private var isTracking = false
+    @State private var pastedLink = ""
+    @State private var linkLog: [String] = []
+    @Environment(\.scenePhase) private var scenePhase
+
+    var body: some View {
+        NavigationStack {
+            Form {
+                Section("FunnelsGrove user") {
+                    Text(userId ?? "No link yet")
+                        .textSelection(.enabled)
+                    Text(email ?? "No email from the link")
+                        .textSelection(.enabled)
+                }
+                Section("Subscription") {
+                    Text(status)
+                    Button(isChecking ? "Checking…" : "Check") {
+                        Task { await check() }
+                    }
+                    .disabled(isChecking)
+                }
+                Section("App login") {
+                    Text(loginStatus)
+                        .font(.footnote)
+                    Button(isTracking ? "Tracking…" : "Track login") {
+                        isTracking = true
+                        Task { await trackLogin() }
+                    }
+                    .disabled(isTracking)
+                }
+                Section("Last links received") {
+                    Text(linkLog.isEmpty ? "None" : linkLog.joined(separator: "\n"))
+                        .font(.footnote)
+                        .textSelection(.enabled)
+                }
+                Section("Paste a link") {
+                    TextField("Link", text: $pastedLink, prompt: Text(verbatim: "fgdemo://open?user_id=…&email=…"))
+                        .textInputAutocapitalization(.never)
+                        .autocorrectionDisabled()
+                    Button("Handle link") {
+                        if let url = URL(string: pastedLink.trimmingCharacters(in: .whitespacesAndNewlines)) {
+                            linked(FunnelsGrove.shared.handle(url))
+                        }
+                    }
+                }
+                Section {
+                    Button("Reset", role: .destructive) {
+                        FunnelsGrove.shared.reset()
+                        refreshUser()
+                        status = "Not checked"
+                        loginStatus = Self.loginHint
+                    }
+                }
+            }
+            .navigationTitle("FunnelsGrove Demo")
+        }
+        // A custom scheme arrives in onOpenURL; SwiftUI routes a Universal Link to one of these two handlers.
+        // "Last links received" shows which.
+        .onContinueUserActivity(NSUserActivityTypeBrowsingWeb) { activity in
+            linkLog.append("onContinueUserActivity: \(activity.webpageURL?.absoluteString ?? "no URL")")
+            linked(FunnelsGrove.shared.handle(activity))
+        }
+        .onOpenURL { url in
+            linkLog.append("onOpenURL: \(url.absoluteString)")
+            linked(FunnelsGrove.shared.handle(url))
+        }
+        .onChange(of: scenePhase) { _, phase in
+            // iCloud Keychain may deliver the user while the app is in the background.
+            if phase == .active { refreshUser() }
+        }
+    }
+
+    private func refreshUser() {
+        userId = FunnelsGrove.shared.userId
+        email = FunnelsGrove.shared.email
+    }
+
+    private func linked(_ handled: Bool) {
+        guard handled else {
+            status = "Ignored: no valid user_id in the link"
+            return
+        }
+        refreshUser()
+        // The demo records the login with its own button, so that a test can see it apart from the link.
+        Task { await check() }
+    }
+
+    private func check() async {
+        isChecking = true
+        status = "Checking…"
+        defer { isChecking = false }
+        do {
+            status = describe(try await FunnelsGrove.shared.checkSubscription())
+        } catch is CancellationError {
+            status = "Not checked"
+        } catch {
+            status = "Error: \(error)"
+        }
+    }
+
+    private func describe(_ result: SubscriptionStatus) -> String {
+        guard result.userId != nil else { return "No user" }
+        guard result.isKnownUser else { return "Unknown to FunnelsGrove" }
+        if result.isActive { return result.isTest ? "Active (test)" : "Active" }
+        return result.isTest ? "Inactive (test)" : "Inactive"
+    }
+
+    private func trackLogin() async {
+        defer { isTracking = false }
+        loginStatus = "Tracking…"
+        do {
+            loginStatus = try await FunnelsGrove.shared.trackLogin() ? "Tracked" : "No user: open a link first"
+        } catch FunnelsGroveError.unknownUser {
+            loginStatus = "FunnelsGrove does not know this user in the project"
+        } catch is CancellationError {
+            loginStatus = Self.loginHint
+        } catch {
+            loginStatus = "Error: \(error)"
+        }
+    }
+}
+```
+
+- [ ] **Step 7: Сгенерировать проект и собрать без подписи**
+
+```bash
+cd /Users/e/work2/appsilove/funnelsgrove-ios-sdk/Examples/FunnelsGroveDemo
+xcodegen generate
+xcodebuild build -project FunnelsGroveDemo.xcodeproj -scheme FunnelsGroveDemo \
+  -destination 'generic/platform=iOS Simulator' CODE_SIGNING_ALLOWED=NO 2>&1 | grep -E "error:|warning:|BUILD (SUCCEEDED|FAILED)" | grep -v appintents
+/usr/libexec/PlistBuddy -c "Print :CFBundleURLTypes:0:CFBundleURLSchemes:0" Support/Info.plist
+cd ../.. && git status --short
+```
+
+Ожидается:
+- `Created project at …/FunnelsGroveDemo.xcodeproj`, затем `** BUILD SUCCEEDED **` без `warning:`;
+- PlistBuddy печатает `fgdemo`;
+- `git status --short` показывает только `Examples/FunnelsGroveDemo/project.yml`, `Config/` и исходники. Проект, `Support/` и `Local.xcconfig` в статусе не появляются.
+
+- [ ] **Step 8: Проверить ссылку на симуляторе (без подписи и без владельца)**
+
+Пробный ключ проходит проверку `configure`, а FG отвечает на него 401: так видно и разбор ссылки, и маппинг ошибки.
+
+```bash
+cd /Users/e/work2/appsilove/funnelsgrove-ios-sdk/Examples/FunnelsGroveDemo
+DEVICE_ID=$(xcrun simctl list devices available | grep -m1 -E '^\s+iPhone' | grep -oE '[0-9A-F-]{36}')
+xcodebuild build -project FunnelsGroveDemo.xcodeproj -scheme FunnelsGroveDemo -destination "id=$DEVICE_ID" \
+  -derivedDataPath ../../.build/fgdemo-dd CODE_SIGNING_ALLOWED=NO FG_PUBLISHABLE_KEY=sdk_pub_dummy 2>&1 | grep -E "error:|BUILD (SUCCEEDED|FAILED)"
+xcrun simctl boot "$DEVICE_ID" 2>/dev/null; xcrun simctl bootstatus "$DEVICE_ID" -b >/dev/null
+xcrun simctl install "$DEVICE_ID" ../../.build/fgdemo-dd/Build/Products/Debug-iphonesimulator/FunnelsGroveDemo.app
+xcrun simctl launch "$DEVICE_ID" com.funnelsgrove.demo
+xcrun simctl openurl "$DEVICE_ID" "fgdemo://open?user_id=u_sim_check&email=buyer%2Bqa%40example.com&utm_source=fg"
+```
+
+iOS спрашивает «Open in "FunnelsGrove Demo"?»: нажать Open в окне симулятора.
+
+Ожидается:
+- «FunnelsGrove user»: `u_sim_check` и `buyer+qa@example.com`;
+- «Last links received»: `onOpenURL: fgdemo://open?user_id=u_sim_check&email=buyer%2Bqa%40example.com&utm_source=fg`;
+- «Subscription»: `Error: configuration("FunnelsGrove answered 401: check publishableKey")`.
+
+Неподписанная сборка не может писать в Keychain (в консоли — ошибка `com.funnelsgrove.sdk`, категория Keychain), поэтому SDK держит пользователя в памяти. Хранение проверяется на шаге 10.
+
+Затем убрать за собой:
+
+```bash
+xcrun simctl uninstall "$DEVICE_ID" com.funnelsgrove.demo && xcrun simctl shutdown "$DEVICE_ID"
+```
+
+- [ ] **Step 9: Commit**
+
+```bash
+cd /Users/e/work2/appsilove/funnelsgrove-ios-sdk
+git add Examples/FunnelsGroveDemo/project.yml Examples/FunnelsGroveDemo/Config Examples/FunnelsGroveDemo/FunnelsGroveDemo
+git commit -m "feat: add the demo app for links, subscription checks and app logins" -m "Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
+```
+
+- [ ] **Step 10 (с владельцем): Проверить реальный Keychain на симуляторе**
+
+Владелец заполняет `Config/Local.xcconfig`: Team ID и publishable key тестового FG-проекта.
+
+```bash
+cd /Users/e/work2/appsilove/funnelsgrove-ios-sdk/Examples/FunnelsGroveDemo
+cp Config/Local.xcconfig.example Config/Local.xcconfig   # вписать DEVELOPMENT_TEAM и FG_PUBLISHABLE_KEY
+xcodegen generate
+open FunnelsGroveDemo.xcodeproj
+```
+
+В Xcode запустить схему `FunnelsGroveDemo` на iPhone-симуляторе и проверить по шагам:
+
+1. Вставить `fgdemo://open?user_id=u_keychain_check&email=keychain%40example.com` и нажать Handle link. Сразу появятся `u_keychain_check` и `keychain@example.com`. Примерно через 15 секунд статус станет «Unknown to FunnelsGrove»: такого пользователя в FG нет, а SDK после свежей ссылки ещё опрашивает FG.
+2. Нажать Track login: «FunnelsGrove does not know this user in the project».
+3. Вставить `fgdemo://open?user_id=u_keychain_check` (без email) и нажать Handle link: email остался `keychain@example.com`.
+4. Остановить приложение в Xcode и запустить снова: `u_keychain_check` и email на месте, значит запись прочиталась из Keychain.
+5. Удалить приложение с симулятора (долгое нажатие на иконку → Remove App) и снова запустить из Xcode: оба значения на месте.
+6. Вставить `fgdemo://open?user_id=u_other` и нажать Handle link: `u_other` и «No email from the link».
+7. Нажать Reset и перезапустить: «No link yet» и «No email from the link».
+
+Если после перезапуска виден «No link yet», сначала посмотреть в консоли Xcode ошибки подсистемы `com.funnelsgrove.sdk` (категория Keychain). Симулятор — самое слабое место для синхронизируемых записей Keychain; окончательная проверка — шаг 5 задачи 8 на устройстве.
+
+---
+
+### Task 8: E2E на устройстве (с владельцем)
+
+**Files:** нет, только проверка.
+
+Что должно быть готово:
+- Тестовый FG-проект: в настройках App Store deeplink `fgdemo://open` (в env — `NEXT_PUBLIC_FUNNEL_IOS_DEEP_LINK`), воронка опубликована. Если кнопка «Open app now» не поменялась, воронку нужно переопубликовать.
+- В `Config/Local.xcconfig` указаны Team ID и publishable key этого FG-проекта.
+- iPhone в Developer Mode, подключён к Mac.
+- Для проверок через `curl` ключ лежит в переменной окружения: `export FG_KEY=<publishable key тестового FG-проекта>`. В выводе команд ключ не печатается. `u_…` в командах — id покупателя из «Last links received».
+
+- [ ] **Step 1: Поставить Debug-сборку на iPhone**
+
+В Xcode выбрать подключённый iPhone и запустить схему `FunnelsGroveDemo`.
+
+- [ ] **Step 2: Проверить схему**
+
+В Safari на iPhone ввести в адресную строку `fgdemo://open?user_id=u_probe&email=probe%40example.com` и подтвердить «Open in "FunnelsGrove Demo"?».
+
+Ожидается: открывается демо-приложение и показывает `u_probe` и `probe@example.com`, «Last links received» — `onOpenURL: …`. Проверить и холодный старт (приложение закрыто), и тёплый (приложение открыто). Затем Reset.
+
+- [ ] **Step 3: Тестовая покупка**
+
+В Safari на iPhone пройти тестовую воронку и оплатить тестовой картой Stripe `4242 4242 4242 4242` (любая будущая дата, любой CVC). Открывать воронку по тестовому URL (превью или стандартный домен FG): на собственном боевом домене FG проводит оплату в live-режиме, и тестовая карта не пройдёт.
+
+На экране успеха FG один раз сам переходит по ссылке: Safari спросит, открыть ли FunnelsGrove Demo. Если вопрос пропущен, тапнуть «Open app now».
+
+Ожидается: демо-приложение показывает `u_…` покупателя и email, с которым покупали. Пока идёт опрос, статус — «Checking…», через несколько секунд — «Active (test)».
+
+Если статус другой, сначала спросить FG напрямую, взяв `u_…` из «Last links received»:
+
+```bash
+curl -sS -X POST https://sdk-api.funnelsgrove.com/sdk/public/users/verify_subscription \
+  -H 'Content-Type: application/json' -H "X-SDK-Publishable-Key: $FG_KEY" -d '{"userId":"u_…"}'
+```
+
+Ожидается `{"active":true,"test":true,"user":{"user_id":"u_…"}}`. Если FG отвечает иначе, проблема в воронке или оплате, а не в SDK. Если вместо этого «Ignored: no valid user_id in the link», в «Last links received» виден полученный URL: проверить, что в нём есть `user_id`.
+
+- [ ] **Step 4: Учёт входа**
+
+Нажать Track login.
+
+Ожидается: «Tracked». В FG у этого пользователя появляется «Logged into app». Повторный Track login снова даёт «Tracked», а второго события в FG нет. То же видно через API: повторный вызов отвечает `"newlyTracked":false`, потому что вход уже записан демо-приложением.
+
+```bash
+curl -sS -X POST https://sdk-api.funnelsgrove.com/sdk/public/users/track_login \
+  -H 'Content-Type: application/json' -H "X-SDK-Publishable-Key: $FG_KEY" -d '{"userId":"u_…"}'
+```
+
+- [ ] **Step 5: Переустановка**
+
+Удалить демо-приложение с iPhone и поставить заново из Xcode.
+
+Ожидается: при запуске видны тот же `u_…` и email. Check показывает «Active (test)».
+
+- [ ] **Step 6 (по желанию): Universal Link с чужого для SDK домена**
+
+1. В дашборде appsilove (`https://dashboard.appsilove.co`) или по SQL из `appsilove/links/README.md` завести строку `fgdemo` в `link_apps`: Team ID владельца, bundle ID `com.funnelsgrove.demo`, любой существующий `app_store_id`.
+2. Проверить, что `https://fgdemo.links.appsilove.co/.well-known/apple-app-site-association` отдаёт `<Team ID>.com.funnelsgrove.demo`.
+3. В `Config/Local.xcconfig` раскомментировать `FG_DEMO_LINK_HOST = fgdemo.links.appsilove.co` и `CODE_SIGN_ENTITLEMENTS = Config/UniversalLinks.entitlements`, выполнить `xcodegen generate` и снова поставить Debug-сборку.
+4. На iPhone включить Settings → Developer → Associated Domains Development. В Settings → Developer → Universal Links → Diagnostics ввести `https://fgdemo.links.appsilove.co/open?user_id=u_ul` и убедиться, что ссылка сопоставлена с FunnelsGrove Demo.
+5. Открыть эту ссылку тапом из Notes: демо показывает `u_ul`. В «Last links received» записать, какой обработчик её получил (`onContinueUserActivity` или `onOpenURL`), при холодном и тёплом старте.
+
+Подпись проверяется так: entitlements сборки должны содержать `applinks:fgdemo.links.appsilove.co?mode=developer`.
+
+```bash
+codesign -d --entitlements - "$(find ~/Library/Developer/Xcode/DerivedData -maxdepth 6 -path '*Debug-iphoneos/FunnelsGroveDemo.app' | head -1)" 2>/dev/null | grep -A2 associated-domains
+```
+
+Если ссылка открылась в Safari, а не в приложении, проверить по порядку: AASA через `curl`, Team ID и bundle ID в строке `fgdemo`, entitlements сборки, включён ли Associated Domains Development.
+
+- [ ] **Step 7: Зафиксировать результат**
+
+Сделать скриншоты шагов 3, 4 и 5 и записать, что прошло, а что нет: в описание PR или в заметки задачи.
+
+Push и PR решает владелец. На GitHub ещё нет ветки `main`, а PR нужна база. Один из вариантов — сделать `main` из коммита спеки, тогда в PR войдёт только реализация:
+
+```bash
+cd /Users/e/work2/appsilove/funnelsgrove-ios-sdk
+git push origin b75bc0e:refs/heads/main
+git push -u origin feat/sdk-prototype
+```
