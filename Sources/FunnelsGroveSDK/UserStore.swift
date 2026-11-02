@@ -6,6 +6,8 @@ private let keychainLogger = Logger(subsystem: "com.funnelsgrove.sdk", category:
 
 protocol UserStore {
     func read() -> LinkedUser?
+    /// Writes `user` unless the stored one already reads as it. Pass a user that passes the link rules, as one from
+    /// `LinkParser` or `read()` does: any other never matches `read()` and is rewritten on every save.
     func save(_ user: LinkedUser) throws
     func delete()
 }

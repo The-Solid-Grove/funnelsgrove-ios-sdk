@@ -272,7 +272,8 @@ cd /Users/e/work2/appsilove/funnelsgrove-ios-sdk && rm Tests/FunnelsGroveSDKTest
 import Foundation
 
 /// A FunnelsGrove buyer: the user ID and, when a link carried one, the email they bought with. Also the keychain
-/// record: the coding keys are a stored format, and renaming one loses the user saved by an earlier version.
+/// record: the coding keys are a stored format, and renaming one loses the user saved by an earlier version. New keys
+/// are safe, since older versions ignore them; a changed type makes older versions drop the user.
 struct LinkedUser: Codable, Equatable, Sendable {
     let userId: String
     /// Not verified: the address the buyer typed in the funnel, known to anyone who has the link.
@@ -913,19 +914,54 @@ final class UserStoreTests: XCTestCase {
     }
 
     func testReadsBackWhatItStores() throws {
-        for user in [LinkedUser(userId: "u_1", email: "buyer@example.com"), LinkedUser(userId: "u_1")] {
+        for user in [
+            LinkedUser(userId: "u_1", email: "buyer@example.com"),
+            LinkedUser(userId: "u_1"),
+            LinkedUser(userId: String(repeating: "a", count: 256)),
+            LinkedUser(userId: "u_1", email: String(repeating: "a", count: 249) + "@b.co"),
+        ] {
             XCTAssertEqual(KeychainUserStore.decode(try KeychainUserStore.encode(user)), user)
         }
+        // The stored email is read by the link rules, which trim it.
+        XCTAssertEqual(
+            KeychainUserStore.decode(Data(#"{"userId":"u_1","email":" buyer@example.com "}"#.utf8)),
+            LinkedUser(userId: "u_1", email: "buyer@example.com")
+        )
     }
 
     func testReadsAnItemWithoutAUsableEmail() {
-        for json in [#"{"userId":"u_1"}"#, #"{"userId":"u_1","email":""}"#, #"{"userId":"u_1","email":"a b"}"#] {
+        for email in [
+            "",
+            " ",
+            "a b",
+            "buyer.example.com",
+            #"a\n@example.com"#,
+            // A right-to-left override (JSON escape): a control character that is not whitespace.
+            #"a\u202E@example.com"#,
+            // 255 UTF-8 bytes.
+            String(repeating: "a", count: 250) + "@b.co",
+        ] {
+            let json = #"{"userId":"u_1","email":""# + email + #""}"#
             XCTAssertEqual(KeychainUserStore.decode(Data(json.utf8)), LinkedUser(userId: "u_1"), json)
         }
+        XCTAssertEqual(KeychainUserStore.decode(Data(#"{"userId":"u_1"}"#.utf8)), LinkedUser(userId: "u_1"))
     }
 
     func testTreatsDamagedDataAsNoUser() {
-        for json in ["not json", "{}", #"{"userId":""}"#, #"{"userId":"u 1"}"#, #"{"userId":1}"#, #""u_1""#] {
+        for json in [
+            "not json",
+            "{}",
+            #"{"userId":""}"#,
+            #"{"userId":"u 1"}"#,
+            #"{"userId":"u_1\n"}"#,
+            // NUL is a control character but not whitespace.
+            #"{"userId":"u_1\u0000"}"#,
+            #"{"userId":""# + String(repeating: "a", count: 257) + #""}"#,
+            #"{"userId":1}"#,
+            // An email that is not a string makes the whole item unreadable, not just the email.
+            #"{"userId":"u_1","email":5}"#,
+            #""u_1""#,
+        ] {
             XCTAssertNil(KeychainUserStore.decode(Data(json.utf8)), json)
         }
     }
@@ -951,6 +987,8 @@ private let keychainLogger = Logger(subsystem: "com.funnelsgrove.sdk", category:
 
 protocol UserStore {
     func read() -> LinkedUser?
+    /// Writes `user` unless the stored one already reads as it. Pass a user that passes the link rules, as one from
+    /// `LinkParser` or `read()` does: any other never matches `read()` and is rewritten on every save.
     func save(_ user: LinkedUser) throws
     func delete()
 }
