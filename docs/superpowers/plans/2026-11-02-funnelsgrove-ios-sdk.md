@@ -2555,13 +2555,13 @@ xcodegen generate
 xcodebuild build -project FunnelsGroveDemo.xcodeproj -scheme FunnelsGroveDemo \
   -destination 'generic/platform=iOS Simulator' CODE_SIGNING_ALLOWED=NO 2>&1 | grep -E "error:|warning:|BUILD (SUCCEEDED|FAILED)" | grep -v appintents
 /usr/libexec/PlistBuddy -c "Print :CFBundleURLTypes:0:CFBundleURLSchemes:0" Support/Info.plist
-cd ../.. && git status --short
+cd ../.. && git status --short --untracked-files=all
 ```
 
 Ожидается:
 - `Created project at …/FunnelsGroveDemo.xcodeproj`, затем `** BUILD SUCCEEDED **` без `warning:`;
 - PlistBuddy печатает `fgdemo`;
-- `git status --short` показывает только `Examples/FunnelsGroveDemo/project.yml`, `Config/` и исходники. Проект, `Support/` и `Local.xcconfig` в статусе не появляются.
+- `git status --short --untracked-files=all` показывает только `Examples/FunnelsGroveDemo/project.yml`, файлы `Config/` и исходники (без `--untracked-files=all` git сворачивает новую папку в `?? Examples/`). Проект, `Support/` и `Local.xcconfig` в статусе не появляются.
 
 - [ ] **Step 8: Проверить ссылку на симуляторе (без подписи и без владельца)**
 
@@ -2578,12 +2578,13 @@ xcrun simctl launch "$DEVICE_ID" com.funnelsgrove.demo
 xcrun simctl openurl "$DEVICE_ID" "fgdemo://open?user_id=u_sim_check&email=buyer%2Bqa%40example.com&utm_source=fg"
 ```
 
-iOS спрашивает «Open in "FunnelsGrove Demo"?»: нажать Open в окне симулятора.
+Если iOS спросит «Open in "FunnelsGrove Demo"?», нажать Open в окне симулятора. Когда демо уже на экране, вопроса может не быть.
 
 Ожидается:
 - «FunnelsGrove user»: `u_sim_check` и `buyer+qa@example.com`;
 - «Last links received»: `onOpenURL: fgdemo://open?user_id=u_sim_check&email=buyer%2Bqa%40example.com&utm_source=fg`;
-- «Subscription»: `Error: configuration("FunnelsGrove answered 401: check publishableKey")`.
+- «Subscription»: `Error: configuration("FunnelsGrove answered 401: check publishableKey")`;
+- после нажатия Track login в «App login» — та же ошибка: запрос дошёл до `track_login` в FG.
 
 Неподписанная сборка не может писать в Keychain (в консоли — ошибка `com.funnelsgrove.sdk`, категория Keychain), поэтому SDK держит пользователя в памяти. Хранение проверяется на шаге 10.
 
